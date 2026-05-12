@@ -84,7 +84,17 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     tracing::info!("ferroscope listening on {}", cli.addr);
-    let listener = tokio::net::TcpListener::bind(&cli.addr).await?;
+    let listener = tokio::net::TcpListener::bind(&cli.addr).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AddrInUse {
+            anyhow::anyhow!(
+                "port {} is already in use — kill the existing process with:\n  kill $(lsof -ti :{})",
+                cli.addr,
+                cli.addr.split(':').last().unwrap_or("8080")
+            )
+        } else {
+            anyhow::anyhow!(e)
+        }
+    })?;
     axum::serve(listener, app).await?;
     Ok(())
 }
