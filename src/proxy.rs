@@ -53,16 +53,20 @@ async fn forward(
     let messages_str = body_json["messages"].to_string();
     let prompt_hash = sha256_hex(&messages_str);
 
-    {
+    let loop_detected = {
         let mut det = state.loop_detector.lock().await;
-        if let Some(w) = det.check_and_record(&messages_str) {
-            tracing::warn!(
-                similar_count = w.similar_count,
-                max_similarity = format!("{:.2}", w.max_similarity),
-                "agentic loop detected"
-            );
+        match det.check_and_record(&messages_str) {
+            Some(w) => {
+                tracing::warn!(
+                    similar_count = w.similar_count,
+                    max_similarity = format!("{:.2}", w.max_similarity),
+                    "agentic loop detected"
+                );
+                true
+            }
+            None => false,
         }
-    }
+    };
 
     let mut req = state.http_client.post(UPSTREAM);
     for (name, value) in &headers {
@@ -81,9 +85,9 @@ async fn forward(
         .collect();
 
     if is_streaming {
-        stream_response(state, upstream, status, resp_headers, model, prompt_hash, start).await
+        stream_response(state, upstream, status, resp_headers, model, prompt_hash, loop_detected, start).await
     } else {
-        buffered_response(state, upstream, status, resp_headers, model, prompt_hash, start).await
+        buffered_response(state, upstream, status, resp_headers, model, prompt_hash, loop_detected, start).await
     }
 }
 
@@ -94,6 +98,7 @@ async fn stream_response(
     resp_headers: Vec<(String, String)>,
     model: String,
     prompt_hash: String,
+    loop_detected: bool,
     start: Instant,
 ) -> anyhow::Result<Response<Body>> {
     let (tx, rx) = mpsc::channel::<anyhow::Result<Bytes>>(64);
@@ -131,6 +136,7 @@ async fn stream_response(
             output_tokens,
             latency_ms,
             prompt_hash,
+            loop_detected,
         };
         tracing::info!(
             model = record.model,
@@ -156,6 +162,7 @@ async fn buffered_response(
     resp_headers: Vec<(String, String)>,
     model: String,
     prompt_hash: String,
+    loop_detected: bool,
     start: Instant,
 ) -> anyhow::Result<Response<Body>> {
     let bytes = upstream.bytes().await?;
@@ -178,6 +185,7 @@ async fn buffered_response(
         output_tokens,
         latency_ms,
         prompt_hash,
+        loop_detected,
     };
     tracing::info!(
         model = record.model,
