@@ -16,8 +16,20 @@ use crate::AppState;
 
 const UPSTREAM: &str = "https://api.anthropic.com/v1/messages";
 
-// Header names that must not be blindly forwarded upstream.
-const STRIP_HEADERS: &[&str] = &["host", "content-length", "transfer-encoding", "connection"];
+// Hop-by-hop headers stripped from the client → upstream direction.
+const STRIP_REQUEST_HEADERS: &[&str] =
+    &["host", "content-length", "transfer-encoding", "connection"];
+
+// Hop-by-hop headers stripped from the upstream → client direction.
+// content-length must be removed because reqwest decompresses the body,
+// making the upstream's content-length wrong; axum recomputes the correct one.
+const STRIP_RESPONSE_HEADERS: &[&str] = &[
+    "content-length",
+    "transfer-encoding",
+    "content-encoding",
+    "connection",
+    "keep-alive",
+];
 
 pub async fn handle_messages(
     State(state): State<Arc<AppState>>,
@@ -70,7 +82,7 @@ async fn forward(
 
     let mut req = state.http_client.post(UPSTREAM);
     for (name, value) in &headers {
-        if !STRIP_HEADERS.contains(&name.as_str()) {
+        if !STRIP_REQUEST_HEADERS.contains(&name.as_str()) {
             req = req.header(name, value);
         }
     }
@@ -210,7 +222,9 @@ fn build_response(
     let axum_status = axum::http::StatusCode::from_u16(status.as_u16())?;
     let mut builder = Response::builder().status(axum_status);
     for (name, value) in &headers {
-        builder = builder.header(name.as_str(), value.as_str());
+        if !STRIP_RESPONSE_HEADERS.contains(&name.as_str()) {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
     }
     Ok(builder.body(body)?)
 }
