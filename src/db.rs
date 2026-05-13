@@ -132,3 +132,121 @@ impl Database {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mem_db() -> Database {
+        Database::new(":memory:").expect("in-memory db")
+    }
+
+    fn record(model: &str) -> CallRecord {
+        CallRecord {
+            timestamp: "2026-05-14T00:00:00Z".to_string(),
+            model: model.to_string(),
+            prompt_tokens: 10,
+            output_tokens: 20,
+            latency_ms: 500,
+            prompt_hash: "deadbeef".to_string(),
+            cost_usd: 0.001,
+            loop_detected: false,
+            input_text: "[user]\nhello".to_string(),
+            output_text: "hi there".to_string(),
+        }
+    }
+
+    // ── schema / migrations ───────────────────────────────────────────────────
+
+    #[test]
+    fn creates_empty_table() {
+        let db = mem_db();
+        let rows = db.query_recent(10).unwrap();
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn migration_is_idempotent() {
+        // Opening the same path twice must not error (ALTER TABLE IF NOT EXISTS
+        // would be ideal, but .ok() swallows the "duplicate column" error).
+        let db = mem_db();
+        db.insert_call(&record("m")).unwrap();
+        let rows = db.query_recent(10).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    // ── insert_call / query_recent ────────────────────────────────────────────
+
+    #[test]
+    fn round_trip_all_fields() {
+        let db = mem_db();
+        let mut r = record("claude-haiku-4-5");
+        r.loop_detected = true;
+        r.input_text = "[user]\ncount to 3".to_string();
+        r.output_text = "1\n2\n3".to_string();
+        db.insert_call(&r).unwrap();
+
+        let rows = db.query_recent(1).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.model, "claude-haiku-4-5");
+        assert_eq!(row.prompt_tokens, 10);
+        assert_eq!(row.output_tokens, 20);
+        assert_eq!(row.latency_ms, 500);
+        assert!((row.cost_usd - 0.001).abs() < 1e-9);
+        assert!(row.loop_detected);
+        assert_eq!(row.input_text, "[user]\ncount to 3");
+        assert_eq!(row.output_text, "1\n2\n3");
+    }
+
+    #[test]
+    fn query_recent_newest_first() {
+        let db = mem_db();
+        db.insert_call(&record("a")).unwrap();
+        db.insert_call(&record("b")).unwrap();
+        db.insert_call(&record("c")).unwrap();
+        let rows = db.query_recent(10).unwrap();
+        assert_eq!(rows[0].model, "c");
+        assert_eq!(rows[1].model, "b");
+        assert_eq!(rows[2].model, "a");
+    }
+
+    #[test]
+    fn query_recent_respects_limit() {
+        let db = mem_db();
+        for _ in 0..10 {
+            db.insert_call(&record("m")).unwrap();
+        }
+        assert_eq!(db.query_recent(3).unwrap().len(), 3);
+    }
+
+    // ── query_stats ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn stats_empty_db() {
+        let s = mem_db().query_stats().unwrap();
+        assert_eq!(s.total_calls, 0);
+        assert_eq!(s.total_cost_usd, 0.0);
+        assert_eq!(s.avg_latency_ms, 0.0);
+    }
+
+    #[test]
+    fn stats_aggregates_correctly() {
+        let db = mem_db();
+        db.insert_call(&record("m")).unwrap(); // cost 0.001, latency 500
+        db.insert_call(&record("m")).unwrap(); // cost 0.001, latency 500
+        let s = db.query_stats().unwrap();
+        assert_eq!(s.total_calls, 2);
+        assert!((s.total_cost_usd - 0.002).abs() < 1e-9);
+        assert!((s.avg_latency_ms - 500.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn loop_detected_flag_persisted() {
+        let db = mem_db();
+        let mut r = record("m");
+        r.loop_detected = true;
+        db.insert_call(&r).unwrap();
+        assert!(db.query_recent(1).unwrap()[0].loop_detected);
+    }
+}

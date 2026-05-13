@@ -355,3 +355,214 @@ fn compute_cost(model: &str, input_tokens: i64, output_tokens: i64) -> f64 {
     let (ir, or_) = model_pricing(model);
     (input_tokens as f64 * ir + output_tokens as f64 * or_) / 1_000_000.0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── sha256_hex ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sha256_known_vector() {
+        // NIST known-answer: SHA-256("hello")
+        assert_eq!(
+            sha256_hex("hello"),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+    }
+
+    #[test]
+    fn sha256_empty_string() {
+        assert_eq!(
+            sha256_hex(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn sha256_different_inputs_differ() {
+        assert_ne!(sha256_hex("abc"), sha256_hex("abd"));
+    }
+
+    // ── model pricing / compute_cost ──────────────────────────────────────────
+
+    #[test]
+    fn cost_zero_tokens_is_zero() {
+        assert_eq!(compute_cost("claude-haiku-4-5", 0, 0), 0.0);
+    }
+
+    #[test]
+    fn cost_haiku_one_million_each() {
+        // $0.80/M input + $4.00/M output = $4.80
+        let c = compute_cost("claude-haiku-4-5", 1_000_000, 1_000_000);
+        assert!((c - 4.80).abs() < 1e-6, "got {c}");
+    }
+
+    #[test]
+    fn cost_sonnet_one_million_each() {
+        // $3.00/M input + $15.00/M output = $18.00
+        let c = compute_cost("claude-sonnet-4-6", 1_000_000, 1_000_000);
+        assert!((c - 18.0).abs() < 1e-6, "got {c}");
+    }
+
+    #[test]
+    fn cost_opus_one_million_each() {
+        // $15.00/M input + $75.00/M output = $90.00
+        let c = compute_cost("claude-opus-4-7", 1_000_000, 1_000_000);
+        assert!((c - 90.0).abs() < 1e-6, "got {c}");
+    }
+
+    #[test]
+    fn cost_gpt4o_one_million_each() {
+        // $2.50/M input + $10.00/M output = $12.50
+        let c = compute_cost("gpt-4o", 1_000_000, 1_000_000);
+        assert!((c - 12.5).abs() < 1e-6, "got {c}");
+    }
+
+    #[test]
+    fn cost_unknown_model_uses_positive_fallback() {
+        let c = compute_cost("some-unknown-model-v99", 1_000_000, 0);
+        assert!(c > 0.0);
+    }
+
+    // ── format_messages ───────────────────────────────────────────────────────
+
+    #[test]
+    fn format_messages_null_returns_empty() {
+        assert_eq!(format_messages(&serde_json::json!(null)), "");
+    }
+
+    #[test]
+    fn format_messages_empty_array() {
+        assert_eq!(format_messages(&serde_json::json!([])), "");
+    }
+
+    #[test]
+    fn format_messages_string_content() {
+        let v = serde_json::json!([
+            {"role": "user",      "content": "hello"},
+            {"role": "assistant", "content": "hi there"}
+        ]);
+        let out = format_messages(&v);
+        assert!(out.contains("[user]\nhello"), "got: {out}");
+        assert!(out.contains("[assistant]\nhi there"), "got: {out}");
+    }
+
+    #[test]
+    fn format_messages_array_content_text_and_image() {
+        let v = serde_json::json!([{
+            "role": "user",
+            "content": [
+                {"type": "text",  "text": "describe this"},
+                {"type": "image", "source": {"type": "base64", "data": "..."}}
+            ]
+        }]);
+        let out = format_messages(&v);
+        assert!(out.contains("describe this"), "got: {out}");
+        assert!(out.contains("[image]"), "got: {out}");
+    }
+
+    #[test]
+    fn format_messages_tool_use_block() {
+        let v = serde_json::json!([{
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "t1", "name": "web_search", "input": {}}
+            ]
+        }]);
+        let out = format_messages(&v);
+        assert!(out.contains("[tool_use: web_search]"), "got: {out}");
+    }
+
+    // ── extract_response_text ─────────────────────────────────────────────────
+
+    #[test]
+    fn extract_text_single_block() {
+        let v = serde_json::json!({
+            "content": [{"type": "text", "text": "hello world"}]
+        });
+        assert_eq!(extract_response_text(&v), "hello world");
+    }
+
+    #[test]
+    fn extract_text_multiple_text_blocks_joined() {
+        let v = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "first"},
+                {"type": "text", "text": "second"}
+            ]
+        });
+        let out = extract_response_text(&v);
+        assert!(out.contains("first") && out.contains("second"), "got: {out}");
+    }
+
+    #[test]
+    fn extract_text_skips_non_text_blocks() {
+        let v = serde_json::json!({
+            "content": [
+                {"type": "tool_use", "name": "fn", "id": "x", "input": {}},
+                {"type": "text", "text": "after tool"}
+            ]
+        });
+        let out = extract_response_text(&v);
+        assert_eq!(out, "after tool");
+    }
+
+    #[test]
+    fn extract_text_no_content_key() {
+        let v = serde_json::json!({"type": "error", "error": {"message": "bad key"}});
+        assert_eq!(extract_response_text(&v), "");
+    }
+
+    // ── parse_sse ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_sse_empty_string() {
+        let (inp, out, text) = parse_sse("");
+        assert_eq!((inp, out, text.as_str()), (0, 0, ""));
+    }
+
+    #[test]
+    fn parse_sse_full_stream() {
+        let raw = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":8}}}\n",
+            "\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n",
+            "\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}\n",
+            "\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":2}}\n",
+            "\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n",
+        );
+        let (inp, out, text) = parse_sse(raw);
+        assert_eq!(inp, 8);
+        assert_eq!(out, 2);
+        assert_eq!(text, "Hello world");
+    }
+
+    #[test]
+    fn parse_sse_ignores_malformed_json_lines() {
+        let raw = "data: not-json\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n";
+        let (inp, _, _) = parse_sse(raw);
+        assert_eq!(inp, 3);
+    }
+
+    #[test]
+    fn parse_sse_accumulates_multiple_text_deltas() {
+        let deltas = (0..5)
+            .map(|i| {
+                format!(
+                    "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{i}\"}}}}\n"
+                )
+            })
+            .collect::<String>();
+        let (_, _, text) = parse_sse(&deltas);
+        assert_eq!(text, "01234");
+    }
+}
