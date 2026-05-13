@@ -3,3 +3,4 @@ ferroscope.db
 *.db-shm
 *.db-wal
 .env
+*.log
