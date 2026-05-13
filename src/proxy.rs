@@ -96,10 +96,12 @@ async fn forward(
         .filter_map(|(k, v)| Some((k.to_string(), v.to_str().ok()?.to_string())))
         .collect();
 
+    let input_text = format_messages(&body_json["messages"]);
+
     if is_streaming {
-        stream_response(state, upstream, status, resp_headers, model, prompt_hash, loop_detected, start).await
+        stream_response(state, upstream, status, resp_headers, model, prompt_hash, loop_detected, input_text, start).await
     } else {
-        buffered_response(state, upstream, status, resp_headers, model, prompt_hash, loop_detected, start).await
+        buffered_response(state, upstream, status, resp_headers, model, prompt_hash, loop_detected, input_text, start).await
     }
 }
 
@@ -111,6 +113,7 @@ async fn stream_response(
     model: String,
     prompt_hash: String,
     loop_detected: bool,
+    input_text: String,
     start: Instant,
 ) -> anyhow::Result<Response<Body>> {
     let (tx, rx) = mpsc::channel::<anyhow::Result<Bytes>>(64);
@@ -138,7 +141,7 @@ async fn stream_response(
         }
         drop(tx);
 
-        let (prompt_tokens, output_tokens) = parse_sse_usage(&raw);
+        let (prompt_tokens, output_tokens, output_text) = parse_sse(&raw);
         let latency_ms = start.elapsed().as_millis() as i64;
         let record = CallRecord {
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -149,6 +152,8 @@ async fn stream_response(
             latency_ms,
             prompt_hash,
             loop_detected,
+            input_text,
+            output_text,
         };
         tracing::info!(
             model = record.model,
@@ -175,19 +180,20 @@ async fn buffered_response(
     model: String,
     prompt_hash: String,
     loop_detected: bool,
+    input_text: String,
     start: Instant,
 ) -> anyhow::Result<Response<Body>> {
     let bytes = upstream.bytes().await?;
     let latency_ms = start.elapsed().as_millis() as i64;
 
-    let (prompt_tokens, output_tokens) = serde_json::from_slice::<Value>(&bytes)
+    let (prompt_tokens, output_tokens, output_text) = serde_json::from_slice::<Value>(&bytes)
         .map(|v| {
-            (
-                v["usage"]["input_tokens"].as_i64().unwrap_or(0),
-                v["usage"]["output_tokens"].as_i64().unwrap_or(0),
-            )
+            let pt = v["usage"]["input_tokens"].as_i64().unwrap_or(0);
+            let ot = v["usage"]["output_tokens"].as_i64().unwrap_or(0);
+            let text = extract_response_text(&v);
+            (pt, ot, text)
         })
-        .unwrap_or((0, 0));
+        .unwrap_or_default();
 
     let record = CallRecord {
         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -198,6 +204,8 @@ async fn buffered_response(
         latency_ms,
         prompt_hash,
         loop_detected,
+        input_text,
+        output_text,
     };
     tracing::info!(
         model = record.model,
@@ -235,10 +243,11 @@ fn sha256_hex(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
 }
 
-/// Extract token counts from a raw Anthropic SSE response body.
-fn parse_sse_usage(raw: &str) -> (i64, i64) {
+/// Parse a raw Anthropic SSE body → (input_tokens, output_tokens, output_text).
+fn parse_sse(raw: &str) -> (i64, i64, String) {
     let mut input = 0i64;
     let mut output = 0i64;
+    let mut text = String::new();
 
     for line in raw.lines() {
         let Some(data) = line.strip_prefix("data: ") else {
@@ -258,10 +267,68 @@ fn parse_sse_usage(raw: &str) -> (i64, i64) {
                     output = t;
                 }
             }
+            Some("content_block_delta") => {
+                if v["delta"]["type"].as_str() == Some("text_delta") {
+                    if let Some(t) = v["delta"]["text"].as_str() {
+                        text.push_str(t);
+                    }
+                }
+            }
             _ => {}
         }
     }
-    (input, output)
+    (input, output, text)
+}
+
+/// Pull the text content out of a non-streaming Anthropic response.
+fn extract_response_text(v: &Value) -> String {
+    v["content"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|block| {
+                    if block["type"].as_str() == Some("text") {
+                        block["text"].as_str().map(str::to_owned)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// Render the messages array as readable "[role]\ncontent" blocks.
+fn format_messages(messages: &Value) -> String {
+    let Some(arr) = messages.as_array() else {
+        return String::new();
+    };
+    arr.iter()
+        .map(|m| {
+            let role = m["role"].as_str().unwrap_or("?");
+            let content = match &m["content"] {
+                Value::String(s) => s.clone(),
+                Value::Array(parts) => parts
+                    .iter()
+                    .filter_map(|p| match p["type"].as_str() {
+                        Some("text") => p["text"].as_str().map(str::to_owned),
+                        Some("image") => Some("[image]".to_owned()),
+                        Some("tool_use") => Some(format!(
+                            "[tool_use: {}]",
+                            p["name"].as_str().unwrap_or("?")
+                        )),
+                        Some("tool_result") => Some("[tool_result]".to_owned()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => String::new(),
+            };
+            format!("[{role}]\n{content}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// Per-million-token pricing (input, output) in USD.

@@ -12,6 +12,8 @@ pub struct CallRecord {
     pub prompt_hash: String,
     pub cost_usd: f64,
     pub loop_detected: bool,
+    pub input_text: String,
+    pub output_text: String,
 }
 
 // Read back for the TUI.
@@ -24,6 +26,8 @@ pub struct CallRow {
     pub latency_ms: i64,
     pub cost_usd: f64,
     pub loop_detected: bool,
+    pub input_text: String,
+    pub output_text: String,
 }
 
 #[derive(Default)]
@@ -51,17 +55,17 @@ impl Database {
                 latency_ms    INTEGER NOT NULL,
                 prompt_hash   TEXT    NOT NULL,
                 cost_usd      REAL    NOT NULL,
-                loop_detected INTEGER NOT NULL DEFAULT 0
+                loop_detected INTEGER NOT NULL DEFAULT 0,
+                input_text    TEXT    NOT NULL DEFAULT '',
+                output_text   TEXT    NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_calls_timestamp   ON calls(timestamp);
             CREATE INDEX IF NOT EXISTS idx_calls_prompt_hash ON calls(prompt_hash);",
         )?;
-        // Non-destructive migration for DBs created before loop_detected existed.
-        conn.execute(
-            "ALTER TABLE calls ADD COLUMN loop_detected INTEGER NOT NULL DEFAULT 0",
-            [],
-        )
-        .ok();
+        // Non-destructive migrations for DBs created before these columns existed.
+        conn.execute("ALTER TABLE calls ADD COLUMN loop_detected INTEGER NOT NULL DEFAULT 0", []).ok();
+        conn.execute("ALTER TABLE calls ADD COLUMN input_text TEXT NOT NULL DEFAULT ''", []).ok();
+        conn.execute("ALTER TABLE calls ADD COLUMN output_text TEXT NOT NULL DEFAULT ''", []).ok();
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -71,8 +75,8 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO calls
-             (timestamp, model, prompt_tokens, output_tokens, latency_ms, prompt_hash, cost_usd, loop_detected)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (timestamp, model, prompt_tokens, output_tokens, latency_ms, prompt_hash, cost_usd, loop_detected, input_text, output_text)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 r.timestamp,
                 r.model,
@@ -82,6 +86,8 @@ impl Database {
                 r.prompt_hash,
                 r.cost_usd,
                 r.loop_detected as i64,
+                r.input_text,
+                r.output_text,
             ],
         )?;
         Ok(())
@@ -90,7 +96,7 @@ impl Database {
     pub fn query_recent(&self, limit: usize) -> anyhow::Result<Vec<CallRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, timestamp, model, prompt_tokens, output_tokens, latency_ms, cost_usd, loop_detected
+            "SELECT id, timestamp, model, prompt_tokens, output_tokens, latency_ms, cost_usd, loop_detected, input_text, output_text
              FROM calls ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt
@@ -104,6 +110,8 @@ impl Database {
                     latency_ms: row.get(5)?,
                     cost_usd: row.get(6)?,
                     loop_detected: row.get::<_, i64>(7)? != 0,
+                    input_text: row.get(8)?,
+                    output_text: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

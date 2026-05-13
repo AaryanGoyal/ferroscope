@@ -9,12 +9,14 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{
+    Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap,
+};
 use ratatui::Terminal;
 
 use crate::db::{CallRow, Database, Stats};
 
-// Restores the terminal when dropped — works even on panic.
 struct TerminalHandle {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
 }
@@ -55,6 +57,14 @@ impl TuiState {
     fn refresh(&mut self, db: &Database) {
         self.rows = db.query_recent(100).unwrap_or_default();
         self.stats = db.query_stats().unwrap_or_default();
+        // Keep selection in bounds after a refresh.
+        if let Some(i) = self.table_state.selected() {
+            if self.rows.is_empty() {
+                self.table_state.select(None);
+            } else if i >= self.rows.len() {
+                self.table_state.select(Some(self.rows.len() - 1));
+            }
+        }
     }
 
     fn scroll_up(&mut self) {
@@ -77,6 +87,10 @@ impl TuiState {
             .unwrap_or(0);
         self.table_state.select(Some(i));
     }
+
+    fn selected_row(&self) -> Option<&CallRow> {
+        self.table_state.selected().and_then(|i| self.rows.get(i))
+    }
 }
 
 pub fn run(db: Database) -> anyhow::Result<()> {
@@ -94,7 +108,7 @@ pub fn run(db: Database) -> anyhow::Result<()> {
                 }
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => {
-                        drop(handle); // restore terminal before exit
+                        drop(handle);
                         std::process::exit(0);
                     }
                     KeyCode::Up | KeyCode::Char('k') => state.scroll_up(),
@@ -108,29 +122,31 @@ pub fn run(db: Database) -> anyhow::Result<()> {
 
 fn render(f: &mut ratatui::Frame, state: &mut TuiState) {
     let area = f.area();
+
+    // Outer layout: stats / table / detail / footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // stats header
-            Constraint::Min(0),    // call table
-            Constraint::Length(1), // key hint footer
+            Constraint::Length(3),      // stats header
+            Constraint::Percentage(45), // call table
+            Constraint::Min(6),         // detail panel (input + output)
+            Constraint::Length(1),      // key hints
         ])
         .split(area);
 
     // ── stats header ─────────────────────────────────────────────────────────
-    let header_text = format!(
-        " calls: {}   cost: ${:.4}   avg latency: {:.0}ms",
-        state.stats.total_calls, state.stats.total_cost_usd, state.stats.avg_latency_ms,
-    );
     f.render_widget(
-        Paragraph::new(header_text)
-            .block(
-                Block::default()
-                    .title(" ferroscope ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
-            )
-            .style(Style::default().fg(Color::Cyan)),
+        Paragraph::new(format!(
+            " calls: {}   cost: ${:.4}   avg latency: {:.0}ms",
+            state.stats.total_calls, state.stats.total_cost_usd, state.stats.avg_latency_ms,
+        ))
+        .block(
+            Block::default()
+                .title(" ferroscope ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .style(Style::default().fg(Color::Cyan)),
         chunks[0],
     );
 
@@ -159,7 +175,7 @@ fn render(f: &mut ratatui::Frame, state: &mut TuiState) {
                 .unwrap_or(&r.timestamp)
                 .replace('T', " ");
             Row::new(vec![
-                Cell::from(format!("{} {}", flag, r.id)),
+                Cell::from(format!("{flag} {}", r.id)),
                 Cell::from(ts),
                 Cell::from(r.model.clone()),
                 Cell::from(r.prompt_tokens.to_string()),
@@ -172,31 +188,107 @@ fn render(f: &mut ratatui::Frame, state: &mut TuiState) {
         .collect();
 
     let widths = [
-        Constraint::Length(6),  // id + flag
-        Constraint::Length(20), // timestamp
-        Constraint::Min(18),    // model (elastic)
-        Constraint::Length(7),  // in tokens
-        Constraint::Length(7),  // out tokens
-        Constraint::Length(7),  // latency
-        Constraint::Length(9),  // cost
+        Constraint::Length(6),
+        Constraint::Length(20),
+        Constraint::Min(18),
+        Constraint::Length(7),
+        Constraint::Length(7),
+        Constraint::Length(7),
+        Constraint::Length(9),
     ];
 
-    let table = Table::new(rows, widths)
-        .header(col_header)
-        .block(
-            Block::default()
-                .title(" calls (newest first) ")
-                .borders(Borders::ALL),
-        )
-        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("▶ ");
+    f.render_stateful_widget(
+        Table::new(rows, widths)
+            .header(col_header)
+            .block(
+                Block::default()
+                    .title(" calls (newest first) ")
+                    .borders(Borders::ALL),
+            )
+            .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+            .highlight_symbol("▶ "),
+        chunks[1],
+        &mut state.table_state,
+    );
 
-    f.render_stateful_widget(table, chunks[1], &mut state.table_state);
+    // ── detail panel ─────────────────────────────────────────────────────────
+    // Split the detail area left (input) / right (output).
+    let detail_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[2]);
+
+    let (input_text, output_text, detail_title) = match state.selected_row() {
+        None => (
+            Text::from("(select a row with ↑/k ↓/j)"),
+            Text::from(""),
+            " detail ".to_string(),
+        ),
+        Some(row) => {
+            let title = format!(" call #{} ", row.id);
+
+            let inp = if row.input_text.is_empty() {
+                Text::from(Span::styled("(empty)", Style::default().fg(Color::DarkGray)))
+            } else {
+                build_message_text(&row.input_text)
+            };
+
+            let out = if row.output_text.is_empty() {
+                Text::from(Span::styled("(empty)", Style::default().fg(Color::DarkGray)))
+            } else {
+                Text::raw(row.output_text.clone())
+            };
+
+            (inp, out, title)
+        }
+    };
+
+    f.render_widget(
+        Paragraph::new(input_text)
+            .block(
+                Block::default()
+                    .title(format!("{detail_title}input"))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Blue)),
+            )
+            .wrap(Wrap { trim: false }),
+        detail_chunks[0],
+    );
+
+    f.render_widget(
+        Paragraph::new(output_text)
+            .block(
+                Block::default()
+                    .title(format!("{detail_title}output"))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Green)),
+            )
+            .wrap(Wrap { trim: false }),
+        detail_chunks[1],
+    );
 
     // ── footer ───────────────────────────────────────────────────────────────
     f.render_widget(
         Paragraph::new("  q quit   ↑/k ↓/j scroll   ⚠ = loop detected")
             .style(Style::default().fg(Color::DarkGray)),
-        chunks[2],
+        chunks[3],
     );
+}
+
+/// Colour each "[role]" label, leave content unstyled.
+fn build_message_text(raw: &str) -> Text<'static> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for line in raw.lines() {
+        if line.starts_with('[') && line.contains(']') {
+            lines.push(Line::from(Span::styled(
+                line.to_owned(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            lines.push(Line::from(line.to_owned()));
+        }
+    }
+    Text::from(lines)
 }
