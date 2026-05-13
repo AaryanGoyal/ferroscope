@@ -14,8 +14,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::db::CallRecord;
 use crate::AppState;
 
-const UPSTREAM: &str = "https://api.anthropic.com/v1/messages";
-
 // Hop-by-hop headers stripped from the client → upstream direction.
 const STRIP_REQUEST_HEADERS: &[&str] =
     &["host", "content-length", "transfer-encoding", "connection"];
@@ -80,7 +78,7 @@ async fn forward(
         }
     };
 
-    let mut req = state.http_client.post(UPSTREAM);
+    let mut req = state.http_client.post(&state.upstream_url);
     for (name, value) in &headers {
         if !STRIP_REQUEST_HEADERS.contains(&name.as_str()) {
             req = req.header(name, value);
@@ -564,5 +562,324 @@ mod tests {
             .collect::<String>();
         let (_, _, text) = parse_sse(&deltas);
         assert_eq!(text, "01234");
+    }
+}
+
+// ── Integration tests (proxy handler + mock upstream) ─────────────────────────
+//
+// These tests exercise the full request→forward→response cycle using wiremock
+// to stand in for the Anthropic API. No real network calls are made.
+//
+// Live tests (requires ANTHROPIC_API_KEY) are marked #[ignore] and can be run
+// with:  cargo test live -- --ignored
+#[cfg(test)]
+mod integration {
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::post;
+    use axum::Router;
+    use http_body_util::BodyExt;
+    use tokio::sync::Mutex;
+    use tower::ServiceExt;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::db::Database;
+    use crate::loop_detector::LoopDetector;
+    use crate::AppState;
+    use super::handle_messages;
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
+    fn make_state(upstream_url: String) -> Arc<AppState> {
+        Arc::new(AppState {
+            db: Database::new(":memory:").unwrap(),
+            loop_detector: Mutex::new(LoopDetector::new()),
+            http_client: reqwest::Client::new(),
+            upstream_url,
+        })
+    }
+
+    fn make_app(state: Arc<AppState>) -> Router {
+        Router::new()
+            .route("/v1/messages", post(handle_messages))
+            .with_state(state)
+    }
+
+    async fn collect_body(body: Body) -> bytes::Bytes {
+        body.collect().await.unwrap().to_bytes()
+    }
+
+    const BUFFERED_REQ: &str = r#"{
+        "model": "claude-test",
+        "max_tokens": 10,
+        "messages": [{"role": "user", "content": "hi"}]
+    }"#;
+
+    const STREAM_REQ: &str = r#"{
+        "model": "claude-test",
+        "max_tokens": 10,
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}]
+    }"#;
+
+    // ── buffered path ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn buffered_complete_response_returned_to_client() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(serde_json::json!({
+                        "id": "msg_01",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-test",
+                        "content": [{"type": "text", "text": "Hello!"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 5, "output_tokens": 3}
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let state = make_state(format!("{}/v1/messages", server.uri()));
+        let resp = make_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(BUFFERED_REQ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = collect_body(resp.into_body()).await;
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(json["content"][0]["text"], "Hello!", "response text truncated");
+        assert_eq!(json["usage"]["input_tokens"], 5);
+        assert_eq!(json["usage"]["output_tokens"], 3);
+
+        // DB row logged with correct token counts and extracted output text.
+        let rows = state.db.query_recent(1).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].prompt_tokens, 5);
+        assert_eq!(rows[0].output_tokens, 3);
+        assert_eq!(rows[0].output_text, "Hello!");
+    }
+
+    #[tokio::test]
+    async fn buffered_upstream_status_forwarded_on_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(serde_json::json!({
+                        "type": "error",
+                        "error": {"type": "authentication_error", "message": "bad key"}
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let state = make_state(format!("{}/v1/messages", server.uri()));
+        let resp = make_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(BUFFERED_REQ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let bytes = collect_body(resp.into_body()).await;
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "authentication_error");
+    }
+
+    // ── streaming path ────────────────────────────────────────────────────────
+
+    const SSE_BODY: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" there\"}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    #[tokio::test]
+    async fn streaming_full_sse_stream_forwarded_to_client() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(SSE_BODY),
+            )
+            .mount(&server)
+            .await;
+
+        let state = make_state(format!("{}/v1/messages", server.uri()));
+        let resp = make_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(STREAM_REQ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = collect_body(resp.into_body()).await;
+        let body_str = std::str::from_utf8(&bytes).unwrap();
+
+        // Every SSE event must reach the client intact.
+        assert!(body_str.contains("message_start"),  "missing message_start");
+        assert!(body_str.contains("content_block_delta"), "missing delta events");
+        assert!(body_str.contains("message_stop"),   "missing message_stop");
+        // Text chunks both arrive.
+        assert!(body_str.contains("\"Hi\""),    "missing first text delta");
+        assert!(body_str.contains("\" there\""), "missing second text delta");
+
+        // The spawned logger needs a moment to write after the stream closes.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let rows = state.db.query_recent(1).unwrap();
+        assert_eq!(rows.len(), 1, "streaming call must be logged");
+        assert_eq!(rows[0].prompt_tokens, 5);
+        assert_eq!(rows[0].output_tokens, 2);
+        assert_eq!(rows[0].output_text, "Hi there", "output text must be reconstructed from deltas");
+    }
+
+    #[tokio::test]
+    async fn streaming_upstream_status_forwarded_on_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(serde_json::json!({
+                        "type": "error",
+                        "error": {"type": "rate_limit_error", "message": "too many requests"}
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let state = make_state(format!("{}/v1/messages", server.uri()));
+        let resp = make_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(STREAM_REQ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    // ── live test (requires real API key) ─────────────────────────────────────
+
+    #[tokio::test]
+    #[ignore = "requires ANTHROPIC_API_KEY; run: cargo test live -- --ignored"]
+    async fn live_buffered_round_trip() {
+        let key = std::env::var("ANTHROPIC_API_KEY").expect("set ANTHROPIC_API_KEY");
+
+        let state = make_state("https://api.anthropic.com/v1/messages".to_string());
+        let resp = make_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", key)
+                    .header("anthropic-version", "2023-06-01")
+                    .body(Body::from(r#"{"model":"claude-haiku-4-5","max_tokens":20,"messages":[{"role":"user","content":"Reply with: pong"}]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = collect_body(resp.into_body()).await;
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["type"], "message", "unexpected response: {json}");
+        assert!(!json["content"].as_array().unwrap().is_empty(), "empty content");
+        let text = json["content"][0]["text"].as_str().unwrap_or("");
+        assert!(!text.is_empty(), "response text is empty");
+
+        let rows = state.db.query_recent(1).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].prompt_tokens > 0);
+        assert!(rows[0].output_tokens > 0);
+        assert!(!rows[0].output_text.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ANTHROPIC_API_KEY; run: cargo test live -- --ignored"]
+    async fn live_streaming_round_trip() {
+        let key = std::env::var("ANTHROPIC_API_KEY").expect("set ANTHROPIC_API_KEY");
+
+        let state = make_state("https://api.anthropic.com/v1/messages".to_string());
+        let resp = make_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", key)
+                    .header("anthropic-version", "2023-06-01")
+                    .body(Body::from(r#"{"model":"claude-haiku-4-5","max_tokens":20,"stream":true,"messages":[{"role":"user","content":"Reply with: pong"}]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = collect_body(resp.into_body()).await;
+        let body_str = std::str::from_utf8(&bytes).unwrap();
+        assert!(body_str.contains("message_start"), "missing SSE events");
+        assert!(body_str.contains("message_stop"),  "stream not terminated");
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let rows = state.db.query_recent(1).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].prompt_tokens > 0);
+        assert!(rows[0].output_tokens > 0);
+        assert!(!rows[0].output_text.is_empty());
     }
 }

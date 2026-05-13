@@ -17,6 +17,9 @@ pub struct AppState {
     pub db: Database,
     pub loop_detector: Mutex<LoopDetector>,
     pub http_client: reqwest::Client,
+    /// Full URL of the upstream LLM API (default: Anthropic). Overridable for
+    /// testing or pointing at a custom/compatible endpoint.
+    pub upstream_url: String,
 }
 
 #[derive(Parser)]
@@ -33,6 +36,10 @@ struct Cli {
     /// Launch the ratatui TUI alongside the proxy (logs go to ferroscope.log).
     #[arg(long)]
     tui: bool,
+
+    /// Override the upstream LLM API URL (useful for OpenAI-compatible endpoints).
+    #[arg(long, default_value = "https://api.anthropic.com/v1/messages")]
+    upstream: String,
 }
 
 #[tokio::main]
@@ -77,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
         db,
         loop_detector: Mutex::new(LoopDetector::new()),
         http_client: reqwest::Client::new(),
+        upstream_url: cli.upstream,
     });
 
     let app = Router::new()
