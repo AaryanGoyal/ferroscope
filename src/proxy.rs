@@ -37,6 +37,130 @@ enum Provider {
     OpenAI,
 }
 
+// Incremental SSE accumulator — fixes Bug 3 (UTF-8 splits) and Bug 4 (unbounded memory).
+//
+// Instead of collecting the full raw SSE body in a String, this struct holds only:
+//   - `byte_buf`: leftover bytes that don't yet form a complete UTF-8 sequence
+//   - `line_buf`: the current incomplete SSE line
+//   - the three output values we actually care about (text, input_tokens, output_tokens)
+//
+// Each call to `push` processes as many complete lines as possible and discards them,
+// keeping peak memory proportional to the longest single line rather than the full body.
+struct StreamAccumulator {
+    byte_buf: Vec<u8>,
+    line_buf: String,
+    text: String,
+    input_tokens: i64,
+    output_tokens: i64,
+    provider: Provider,
+}
+
+impl StreamAccumulator {
+    fn new(provider: Provider) -> Self {
+        Self {
+            byte_buf: Vec::new(),
+            line_buf: String::new(),
+            text: String::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            provider,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        self.byte_buf.extend_from_slice(chunk);
+
+        // Determine how many leading bytes form valid UTF-8. Anything beyond that
+        // is the start of a multibyte sequence split across chunk boundaries —
+        // leave it in byte_buf for the next call.
+        let valid_up_to = match std::str::from_utf8(&self.byte_buf) {
+            Ok(_) => self.byte_buf.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        if valid_up_to == 0 {
+            return;
+        }
+
+        // SAFETY: valid_up_to is the exact boundary of valid UTF-8 by construction.
+        let decoded = unsafe { std::str::from_utf8_unchecked(&self.byte_buf[..valid_up_to]) };
+        self.line_buf.push_str(decoded);
+        self.byte_buf.drain(..valid_up_to);
+
+        // Process every complete newline-terminated line; keep the trailing fragment.
+        let mut start = 0;
+        while let Some(rel) = self.line_buf[start..].find('\n') {
+            let end = start + rel;
+            let line = self.line_buf[start..end].to_owned();
+            self.process_line(&line);
+            start = end + 1;
+        }
+        self.line_buf.drain(..start);
+    }
+
+    fn process_line(&mut self, line: &str) {
+        let line = line.trim_end_matches('\r');
+        let Some(data) = line.strip_prefix("data: ") else { return; };
+        if data == "[DONE]" { return; }
+        let Ok(v) = serde_json::from_str::<Value>(data) else { return; };
+        match self.provider {
+            Provider::Anthropic => self.ingest_anthropic(&v),
+            Provider::OpenAI => self.ingest_openai(&v),
+        }
+    }
+
+    fn ingest_anthropic(&mut self, v: &Value) {
+        match v["type"].as_str() {
+            Some("message_start") => {
+                if let Some(t) = v["message"]["usage"]["input_tokens"].as_i64() {
+                    self.input_tokens = t;
+                }
+            }
+            Some("message_delta") => {
+                if let Some(t) = v["usage"]["output_tokens"].as_i64() {
+                    self.output_tokens = t;
+                }
+            }
+            Some("content_block_delta") => {
+                if v["delta"]["type"].as_str() == Some("text_delta") {
+                    if let Some(t) = v["delta"]["text"].as_str() {
+                        self.text.push_str(t);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn ingest_openai(&mut self, v: &Value) {
+        if let Some(choices) = v["choices"].as_array() {
+            for choice in choices {
+                if let Some(content) = choice["delta"]["content"].as_str() {
+                    self.text.push_str(content);
+                }
+            }
+        }
+        if let Some(usage) = v.get("usage") {
+            if !usage.is_null() {
+                if let Some(pt) = usage["prompt_tokens"].as_i64() {
+                    self.input_tokens = pt;
+                }
+                if let Some(ct) = usage["completion_tokens"].as_i64() {
+                    self.output_tokens = ct;
+                }
+            }
+        }
+    }
+
+    // Flush any trailing line that arrived without a final newline, then return results.
+    fn finish(mut self) -> (i64, i64, String) {
+        if !self.line_buf.is_empty() {
+            let line = std::mem::take(&mut self.line_buf);
+            self.process_line(&line);
+        }
+        (self.input_tokens, self.output_tokens, self.text)
+    }
+}
+
 pub fn make_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/messages", post(handle_messages))
@@ -172,19 +296,16 @@ async fn stream_response(
 
     tokio::spawn(async move {
         let mut byte_stream = upstream.bytes_stream();
-        let mut raw = String::new();
+        let mut acc = StreamAccumulator::new(provider);
         let mut first_chunk_at: Option<Instant> = None;
 
         while let Some(chunk) = byte_stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    // Bug 2 fix: capture TTFT on the very first chunk.
                     if first_chunk_at.is_none() {
                         first_chunk_at = Some(Instant::now());
                     }
-                    if let Ok(s) = std::str::from_utf8(&bytes) {
-                        raw.push_str(s);
-                    }
+                    acc.push(&bytes);
                     if tx.send(Ok(bytes)).await.is_err() {
                         return; // client disconnected
                     }
@@ -197,10 +318,7 @@ async fn stream_response(
         }
         drop(tx);
 
-        let (prompt_tokens, output_tokens, output_text) = match provider {
-            Provider::Anthropic => parse_anthropic_sse(&raw),
-            Provider::OpenAI => parse_openai_sse(&raw),
-        };
+        let (prompt_tokens, output_tokens, output_text) = acc.finish();
         // Latency for streaming = time-to-first-token (from request start to first chunk).
         // Falls back to total elapsed if no chunk arrived (error / empty response).
         let latency_ms = first_chunk_at
@@ -788,6 +906,97 @@ mod tests {
             .collect::<String>();
         let (_, _, text) = parse_openai_sse(&deltas);
         assert_eq!(text, "01234");
+    }
+
+    // ── StreamAccumulator (Bug 3 + Bug 4) ────────────────────────────────────
+
+    #[test]
+    fn accumulator_anthropic_single_chunk() {
+        let raw = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":8}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":2}}\n\n",
+        );
+        let mut acc = StreamAccumulator::new(Provider::Anthropic);
+        acc.push(raw.as_bytes());
+        let (inp, out, text) = acc.finish();
+        assert_eq!(inp, 8);
+        assert_eq!(out, 2);
+        assert_eq!(text, "Hello world");
+    }
+
+    #[test]
+    fn accumulator_openai_single_chunk() {
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n",
+        );
+        let mut acc = StreamAccumulator::new(Provider::OpenAI);
+        acc.push(raw.as_bytes());
+        let (pt, ct, text) = acc.finish();
+        assert_eq!(pt, 5);
+        assert_eq!(ct, 2);
+        assert_eq!(text, "Hi there");
+    }
+
+    // Bug 3: multibyte character (3-byte UTF-8) split across two chunks.
+    // The three bytes of '€' (0xE2 0x82 0xAC) arrive in separate push() calls.
+    // Before the fix: from_utf8 would fail on each partial chunk → silent drop.
+    // After the fix: byte_buf carries the incomplete sequence until it's complete.
+    #[test]
+    fn accumulator_utf8_split_across_chunks() {
+        // Build a complete SSE line containing '€' (U+20AC, 3 bytes: E2 82 AC)
+        let json = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"€"}}"#;
+        let line = format!("data: {json}\n");
+        let bytes = line.as_bytes();
+
+        // Split after the first byte of the 3-byte '€' sequence.
+        // '€' starts at the last 3 bytes of `line`; we split just before the full char.
+        // Find where the multi-byte char sits in the JSON string:
+        let euro_pos = bytes.iter().position(|&b| b == 0xE2).expect("€ not found");
+
+        let chunk1 = &bytes[..euro_pos + 1]; // includes 0xE2 only
+        let chunk2 = &bytes[euro_pos + 1..]; // includes 0x82 0xAC and the rest
+
+        let mut acc = StreamAccumulator::new(Provider::Anthropic);
+        acc.push(chunk1);
+        acc.push(chunk2);
+        let (_, _, text) = acc.finish();
+
+        assert_eq!(text, "€", "multibyte char split across chunks must be reconstructed correctly");
+    }
+
+    // Bug 4: memory stays bounded. Feed 1 000 SSE events in 1-byte chunks and
+    // verify line_buf never grows beyond one line's length.
+    #[test]
+    fn accumulator_line_buf_never_grows_unboundedly() {
+        // Build 1 000 identical delta events.
+        let event = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n";
+        let full: String = event.repeat(1_000);
+        let bytes = full.as_bytes();
+
+        let mut acc = StreamAccumulator::new(Provider::Anthropic);
+
+        // Feed one byte at a time — worst case for accumulation.
+        for byte in bytes {
+            acc.push(std::slice::from_ref(byte));
+            // line_buf must never exceed one full event line's length.
+            assert!(
+                acc.line_buf.len() <= event.len(),
+                "line_buf grew to {} bytes — expected ≤ {}",
+                acc.line_buf.len(),
+                event.len()
+            );
+        }
+
+        let (_, _, text) = acc.finish();
+        assert_eq!(text, "x".repeat(1_000));
     }
 }
 
