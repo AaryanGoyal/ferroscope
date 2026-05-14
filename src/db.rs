@@ -127,6 +127,17 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Returns true if a detection with this exact (classifier, call_ids) already exists.
+    pub fn detection_exists(&self, classifier: &str, call_ids: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM detections WHERE classifier = ?1 AND call_ids = ?2",
+            params![classifier, call_ids],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     pub fn update_call_classifier(&self, id: i64, classifier: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(

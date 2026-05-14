@@ -8,8 +8,6 @@ const FINGERPRINT: usize = 300;
 
 pub struct ClassifierResult {
     pub detections: Vec<Detection>,
-    /// (call_id, classifier_name) pairs — caller updates the calls table.
-    pub call_tags: Vec<(i64, String)>,
 }
 
 // ── retry_storm ───────────────────────────────────────────────────────────────
@@ -164,34 +162,18 @@ pub fn check_self_correction(calls: &[CallRow]) -> Option<Detection> {
 pub fn run_all(db: &crate::db::Database) -> anyhow::Result<ClassifierResult> {
     let calls = db.query_recent_calls_window(30)?;
     let mut detections = Vec::new();
-    let mut call_tags: Vec<(i64, String)> = Vec::new();
 
     if let Some(d) = check_retry_storm(&calls) {
-        for id_str in d.call_ids.split(',') {
-            if let Ok(id) = id_str.parse::<i64>() {
-                call_tags.push((id, d.classifier.clone()));
-            }
-        }
         detections.push(d);
     }
     if let Some(d) = check_cost_inflation(&calls) {
-        for id_str in d.call_ids.split(',') {
-            if let Ok(id) = id_str.parse::<i64>() {
-                call_tags.push((id, d.classifier.clone()));
-            }
-        }
         detections.push(d);
     }
     if let Some(d) = check_self_correction(&calls) {
-        for id_str in d.call_ids.split(',') {
-            if let Ok(id) = id_str.parse::<i64>() {
-                call_tags.push((id, d.classifier.clone()));
-            }
-        }
         detections.push(d);
     }
 
-    Ok(ClassifierResult { detections, call_tags })
+    Ok(ClassifierResult { detections })
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -392,7 +374,6 @@ mod tests {
         let db = Database::new(":memory:").unwrap();
         let result = run_all(&db).unwrap();
         assert!(result.detections.is_empty());
-        assert!(result.call_tags.is_empty());
     }
 
     #[test]
