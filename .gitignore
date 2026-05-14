@@ -4,3 +4,5 @@ ferroscope.db
 *.db-wal
 .env
 *.log
+mcp/node_modules/
+mcp/dist/
