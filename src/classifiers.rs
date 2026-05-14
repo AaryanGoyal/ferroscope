@@ -155,12 +155,81 @@ pub fn check_self_correction(calls: &[CallRow]) -> Option<Detection> {
     None
 }
 
+// ── ping_pong ─────────────────────────────────────────────────────────────────
+
+const PING_PONG_SAME: f64 = 0.80; // call[N] vs call[N-2] must be similar
+const PING_PONG_DIFF: f64 = 0.40; // call[N] vs call[N-1] must be dissimilar
+
+/// Detects an agent oscillating A-B-A-B-... between two responses.
+/// Requires at least 3 consecutive calls forming one A-B-A triplet.
+pub fn check_ping_pong(calls: &[CallRow]) -> Option<Detection> {
+    if calls.len() < 3 {
+        return None;
+    }
+
+    let fps: Vec<String> = calls
+        .iter()
+        .map(|c| c.output_text.chars().take(FINGERPRINT).collect())
+        .collect();
+
+    // Find the first index where a valid oscillation triplet ends (index i >= 2).
+    // Then extend the run as long as the pattern holds.
+    let mut run_start: Option<usize> = None;
+    let mut run_end: usize = 0;
+    let mut oscillation_count: usize = 0;
+
+    for i in 2..fps.len() {
+        let sim_same = normalized_levenshtein(&fps[i], &fps[i - 2]); // N vs N-2
+        let sim_diff = normalized_levenshtein(&fps[i], &fps[i - 1]); // N vs N-1
+
+        if sim_same > PING_PONG_SAME && sim_diff < PING_PONG_DIFF {
+            if run_start.is_none() {
+                run_start = Some(i - 2);
+            }
+            run_end = i;
+            oscillation_count += 1;
+        }
+    }
+
+    let start_idx = run_start?; // None if no triplet found
+
+    // Collect call indices in the oscillating run.
+    let involved: Vec<usize> = (start_idx..=run_end).collect();
+    let call_ids: Vec<String> = involved.iter().map(|&i| calls[i].id.to_string()).collect();
+    let total_cost: f64 = involved.iter().map(|&i| calls[i].cost_usd).sum();
+
+    // Compute elapsed seconds between first and last call in the run.
+    let secs = {
+        let t0 = chrono::DateTime::parse_from_rfc3339(&calls[start_idx].timestamp)
+            .map(|dt| dt.timestamp())
+            .unwrap_or(0);
+        let t1 = chrono::DateTime::parse_from_rfc3339(&calls[run_end].timestamp)
+            .map(|dt| dt.timestamp())
+            .unwrap_or(0);
+        (t1 - t0).max(0)
+    };
+
+    Some(Detection {
+        timestamp: Utc::now().to_rfc3339(),
+        classifier: "ping_pong".to_string(),
+        call_ids: call_ids.join(","),
+        detail: format!(
+            "Agent oscillating between two responses, {} oscillations in last {}s, costing ${:.4}",
+            oscillation_count, secs, total_cost
+        ),
+        suggested_fix:
+            "Add a decision lock or take majority vote across 3 samples before committing"
+                .to_string(),
+        cost_usd: total_cost,
+    })
+}
+
 // ── run_all ───────────────────────────────────────────────────────────────────
 
-/// Run all classifiers against the last 30-second window of calls.
+/// Run all classifiers against the last 60-second window of calls.
 /// Returns detected issues and which call IDs triggered which classifier.
 pub fn run_all(db: &crate::db::Database) -> anyhow::Result<ClassifierResult> {
-    let calls = db.query_recent_calls_window(30)?;
+    let calls = db.query_recent_calls_window(60)?;
     let mut detections = Vec::new();
 
     if let Some(d) = check_retry_storm(&calls) {
@@ -170,6 +239,9 @@ pub fn run_all(db: &crate::db::Database) -> anyhow::Result<ClassifierResult> {
         detections.push(d);
     }
     if let Some(d) = check_self_correction(&calls) {
+        detections.push(d);
+    }
+    if let Some(d) = check_ping_pong(&calls) {
         detections.push(d);
     }
 
@@ -365,6 +437,107 @@ mod tests {
         assert_eq!(model_tier("claude-opus-4-7"), 3);
         assert_eq!(model_tier("claude-3-opus-20240229"), 3);
         assert_eq!(model_tier("totally-unknown-v99"), 0);
+    }
+
+    // ── ping_pong ─────────────────────────────────────────────────────────────
+
+    // Two clearly distinct outputs and one that is identical to the first.
+    fn output_a() -> &'static str {
+        "The capital of France is Paris, a city known for the Eiffel Tower and fine cuisine."
+    }
+    fn output_b() -> &'static str {
+        "Quantum entanglement describes a phenomenon where particles become correlated in ways that cannot be explained classically."
+    }
+
+    #[test]
+    fn ping_pong_fires_on_aba_pattern() {
+        let calls = vec![
+            make_call(1, "claude-haiku-4-5", "q", output_a(), 0.001),
+            make_call(2, "claude-haiku-4-5", "q", output_b(), 0.002),
+            make_call(3, "claude-haiku-4-5", "q", output_a(), 0.003),
+        ];
+        let d = check_ping_pong(&calls).expect("should detect ping-pong on A-B-A");
+        assert_eq!(d.classifier, "ping_pong");
+        assert!(d.call_ids.contains('1'));
+        assert!(d.call_ids.contains('2'));
+        assert!(d.call_ids.contains('3'));
+    }
+
+    #[test]
+    fn ping_pong_fires_on_abab_pattern() {
+        let calls = vec![
+            make_call(1, "claude-haiku-4-5", "q", output_a(), 0.001),
+            make_call(2, "claude-haiku-4-5", "q", output_b(), 0.002),
+            make_call(3, "claude-haiku-4-5", "q", output_a(), 0.003),
+            make_call(4, "claude-haiku-4-5", "q", output_b(), 0.004),
+        ];
+        let d = check_ping_pong(&calls).expect("should detect ping-pong on A-B-A-B");
+        assert_eq!(d.classifier, "ping_pong");
+        // All 4 calls should be in the run
+        assert!(d.call_ids.contains('1'));
+        assert!(d.call_ids.contains('4'));
+    }
+
+    #[test]
+    fn ping_pong_no_fire_on_only_two_calls() {
+        let calls = vec![
+            make_call(1, "claude-haiku-4-5", "q", output_a(), 0.001),
+            make_call(2, "claude-haiku-4-5", "q", output_b(), 0.002),
+        ];
+        assert!(check_ping_pong(&calls).is_none());
+    }
+
+    #[test]
+    fn ping_pong_no_fire_when_all_similar() {
+        // A-A-A pattern: every-other pair is similar BUT adjacent pair is also similar
+        // so sim_diff (N vs N-1) will be > 0.40, failing the dissimilarity check.
+        let calls = vec![
+            make_call(1, "claude-haiku-4-5", "q", output_a(), 0.001),
+            make_call(2, "claude-haiku-4-5", "q", output_a(), 0.002),
+            make_call(3, "claude-haiku-4-5", "q", output_a(), 0.003),
+        ];
+        assert!(check_ping_pong(&calls).is_none());
+    }
+
+    #[test]
+    fn ping_pong_no_fire_when_all_dissimilar() {
+        // Three completely different outputs — no consistent A pattern every other call.
+        let output_c =
+            "Machine learning models learn patterns from data through gradient descent optimization.";
+        let calls = vec![
+            make_call(1, "claude-haiku-4-5", "q", output_a(), 0.001),
+            make_call(2, "claude-haiku-4-5", "q", output_b(), 0.002),
+            make_call(3, "claude-haiku-4-5", "q", output_c, 0.003),
+        ];
+        assert!(check_ping_pong(&calls).is_none());
+    }
+
+    #[test]
+    fn ping_pong_cost_summed() {
+        let calls = vec![
+            make_call(1, "claude-haiku-4-5", "q", output_a(), 0.010),
+            make_call(2, "claude-haiku-4-5", "q", output_b(), 0.020),
+            make_call(3, "claude-haiku-4-5", "q", output_a(), 0.030),
+        ];
+        let d = check_ping_pong(&calls).unwrap();
+        assert!((d.cost_usd - 0.060).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ping_pong_detail_contains_oscillation_count() {
+        let calls = vec![
+            make_call(1, "claude-haiku-4-5", "q", output_a(), 0.001),
+            make_call(2, "claude-haiku-4-5", "q", output_b(), 0.002),
+            make_call(3, "claude-haiku-4-5", "q", output_a(), 0.003),
+        ];
+        let d = check_ping_pong(&calls).unwrap();
+        // Detail should contain "1 oscillations" for one triplet
+        assert!(
+            d.detail.contains("1 oscillations"),
+            "detail was: {}",
+            d.detail
+        );
+        assert!(d.detail.contains("costing $"), "detail was: {}", d.detail);
     }
 
     // ── run_all integration ───────────────────────────────────────────────────
