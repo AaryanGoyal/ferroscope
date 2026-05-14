@@ -4,6 +4,8 @@ use std::time::Instant;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, Response, StatusCode};
+use axum::routing::post;
+use axum::Router;
 use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::Value;
@@ -29,21 +31,47 @@ const STRIP_RESPONSE_HEADERS: &[&str] = &[
     "keep-alive",
 ];
 
+#[derive(Clone, Copy)]
+enum Provider {
+    Anthropic,
+    OpenAI,
+}
+
+pub fn make_app(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/v1/messages", post(handle_messages))
+        .route("/v1/chat/completions", post(handle_chat_completions))
+        .with_state(state)
+}
+
+fn error_response(e: anyhow::Error) -> Response<Body> {
+    tracing::error!("proxy error: {e:#}");
+    Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .header("content-type", "application/json")
+        .body(Body::from(format!("{{\"error\":\"{e}\"}}")))
+        .unwrap()
+}
+
 pub async fn handle_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
-    match forward(state, headers, body).await {
+    match forward(state, headers, body, Provider::Anthropic).await {
         Ok(r) => r,
-        Err(e) => {
-            tracing::error!("proxy error: {e:#}");
-            Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .header("content-type", "application/json")
-                .body(Body::from(format!("{{\"error\":\"{e}\"}}")))
-                .unwrap()
-        }
+        Err(e) => error_response(e),
+    }
+}
+
+pub async fn handle_chat_completions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    match forward(state, headers, body, Provider::OpenAI).await {
+        Ok(r) => r,
+        Err(e) => error_response(e),
     }
 }
 
@@ -51,6 +79,7 @@ async fn forward(
     state: Arc<AppState>,
     headers: HeaderMap,
     body: Bytes,
+    provider: Provider,
 ) -> anyhow::Result<Response<Body>> {
     let start = Instant::now();
 
@@ -78,7 +107,12 @@ async fn forward(
         }
     };
 
-    let mut req = state.http_client.post(&state.upstream_url);
+    let upstream_url = match provider {
+        Provider::Anthropic => &state.anthropic_upstream,
+        Provider::OpenAI => &state.openai_upstream,
+    };
+
+    let mut req = state.http_client.post(upstream_url);
     for (name, value) in &headers {
         if !STRIP_REQUEST_HEADERS.contains(&name.as_str()) {
             req = req.header(name, value);
@@ -97,9 +131,9 @@ async fn forward(
     let input_text = format_messages(&body_json["messages"]);
 
     if is_streaming {
-        stream_response(state, upstream, status, resp_headers, model, prompt_hash, loop_detected, input_text, start).await
+        stream_response(state, upstream, status, resp_headers, model, prompt_hash, loop_detected, input_text, start, provider).await
     } else {
-        buffered_response(state, upstream, status, resp_headers, model, prompt_hash, loop_detected, input_text, start).await
+        buffered_response(state, upstream, status, resp_headers, model, prompt_hash, loop_detected, input_text, start, provider).await
     }
 }
 
@@ -113,6 +147,7 @@ async fn stream_response(
     loop_detected: bool,
     input_text: String,
     start: Instant,
+    provider: Provider,
 ) -> anyhow::Result<Response<Body>> {
     let (tx, rx) = mpsc::channel::<anyhow::Result<Bytes>>(64);
     let db = state.db.clone();
@@ -139,7 +174,10 @@ async fn stream_response(
         }
         drop(tx);
 
-        let (prompt_tokens, output_tokens, output_text) = parse_sse(&raw);
+        let (prompt_tokens, output_tokens, output_text) = match provider {
+            Provider::Anthropic => parse_anthropic_sse(&raw),
+            Provider::OpenAI => parse_openai_sse(&raw),
+        };
         let latency_ms = start.elapsed().as_millis() as i64;
         let record = CallRecord {
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -182,16 +220,25 @@ async fn buffered_response(
     loop_detected: bool,
     input_text: String,
     start: Instant,
+    provider: Provider,
 ) -> anyhow::Result<Response<Body>> {
     let bytes = upstream.bytes().await?;
     let latency_ms = start.elapsed().as_millis() as i64;
 
     let (prompt_tokens, output_tokens, output_text) = serde_json::from_slice::<Value>(&bytes)
-        .map(|v| {
-            let pt = v["usage"]["input_tokens"].as_i64().unwrap_or(0);
-            let ot = v["usage"]["output_tokens"].as_i64().unwrap_or(0);
-            let text = extract_response_text(&v);
-            (pt, ot, text)
+        .map(|v| match provider {
+            Provider::Anthropic => {
+                let pt = v["usage"]["input_tokens"].as_i64().unwrap_or(0);
+                let ot = v["usage"]["output_tokens"].as_i64().unwrap_or(0);
+                let text = extract_anthropic_response_text(&v);
+                (pt, ot, text)
+            }
+            Provider::OpenAI => {
+                let pt = v["usage"]["prompt_tokens"].as_i64().unwrap_or(0);
+                let ot = v["usage"]["completion_tokens"].as_i64().unwrap_or(0);
+                let text = extract_openai_response_text(&v);
+                (pt, ot, text)
+            }
         })
         .unwrap_or_default();
 
@@ -246,7 +293,7 @@ fn sha256_hex(s: &str) -> String {
 }
 
 /// Parse a raw Anthropic SSE body → (input_tokens, output_tokens, output_text).
-fn parse_sse(raw: &str) -> (i64, i64, String) {
+fn parse_anthropic_sse(raw: &str) -> (i64, i64, String) {
     let mut input = 0i64;
     let mut output = 0i64;
     let mut text = String::new();
@@ -282,8 +329,47 @@ fn parse_sse(raw: &str) -> (i64, i64, String) {
     (input, output, text)
 }
 
+/// Parse a raw OpenAI SSE body → (prompt_tokens, completion_tokens, output_text).
+fn parse_openai_sse(raw: &str) -> (i64, i64, String) {
+    let mut prompt_tokens = 0i64;
+    let mut completion_tokens = 0i64;
+    let mut text = String::new();
+
+    for line in raw.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data == "[DONE]" {
+            break;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        // Accumulate text from choices[].delta.content
+        if let Some(choices) = v["choices"].as_array() {
+            for choice in choices {
+                if let Some(content) = choice["delta"]["content"].as_str() {
+                    text.push_str(content);
+                }
+            }
+        }
+        // When a line has usage field, grab token counts
+        if let Some(usage) = v.get("usage") {
+            if !usage.is_null() {
+                if let Some(pt) = usage["prompt_tokens"].as_i64() {
+                    prompt_tokens = pt;
+                }
+                if let Some(ct) = usage["completion_tokens"].as_i64() {
+                    completion_tokens = ct;
+                }
+            }
+        }
+    }
+    (prompt_tokens, completion_tokens, text)
+}
+
 /// Pull the text content out of a non-streaming Anthropic response.
-fn extract_response_text(v: &Value) -> String {
+fn extract_anthropic_response_text(v: &Value) -> String {
     v["content"]
         .as_array()
         .map(|arr| {
@@ -299,6 +385,14 @@ fn extract_response_text(v: &Value) -> String {
                 .join("\n")
         })
         .unwrap_or_default()
+}
+
+/// Pull the text content out of a non-streaming OpenAI response.
+fn extract_openai_response_text(v: &Value) -> String {
+    v["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Render the messages array as readable "[role]\ncontent" blocks.
@@ -348,6 +442,10 @@ fn model_pricing(model: &str) -> (f64, f64) {
         (0.15, 0.60)
     } else if model.contains("gpt-4o") {
         (2.5, 10.0)
+    } else if model.contains("gpt-4.1") {
+        (2.0, 8.0)
+    } else if model.contains("gpt-4-turbo") {
+        (10.0, 30.0)
     } else {
         (3.0, 15.0) // conservative fallback
     }
@@ -451,6 +549,20 @@ mod tests {
     }
 
     #[test]
+    fn cost_gpt4_1_one_million_each() {
+        // $2.00/M input + $8.00/M output = $10.00
+        let c = compute_cost("gpt-4.1", 1_000_000, 1_000_000);
+        assert!((c - 10.0).abs() < 1e-6, "got {c}");
+    }
+
+    #[test]
+    fn cost_gpt4_turbo_one_million_each() {
+        // $10.00/M input + $30.00/M output = $40.00
+        let c = compute_cost("gpt-4-turbo", 1_000_000, 1_000_000);
+        assert!((c - 40.0).abs() < 1e-6, "got {c}");
+    }
+
+    #[test]
     fn cost_unknown_model_uses_positive_fallback() {
         let c = compute_cost("some-unknown-model-v99", 1_000_000, 0);
         assert!(c > 0.0);
@@ -505,14 +617,14 @@ mod tests {
         assert!(out.contains("[tool_use: web_search]"), "got: {out}");
     }
 
-    // ── extract_response_text ─────────────────────────────────────────────────
+    // ── extract_anthropic_response_text ───────────────────────────────────────
 
     #[test]
     fn extract_text_single_block() {
         let v = serde_json::json!({
             "content": [{"type": "text", "text": "hello world"}]
         });
-        assert_eq!(extract_response_text(&v), "hello world");
+        assert_eq!(extract_anthropic_response_text(&v), "hello world");
     }
 
     #[test]
@@ -523,7 +635,7 @@ mod tests {
                 {"type": "text", "text": "second"}
             ]
         });
-        let out = extract_response_text(&v);
+        let out = extract_anthropic_response_text(&v);
         assert!(out.contains("first") && out.contains("second"), "got: {out}");
     }
 
@@ -535,26 +647,42 @@ mod tests {
                 {"type": "text", "text": "after tool"}
             ]
         });
-        let out = extract_response_text(&v);
+        let out = extract_anthropic_response_text(&v);
         assert_eq!(out, "after tool");
     }
 
     #[test]
     fn extract_text_no_content_key() {
         let v = serde_json::json!({"type": "error", "error": {"message": "bad key"}});
-        assert_eq!(extract_response_text(&v), "");
+        assert_eq!(extract_anthropic_response_text(&v), "");
     }
 
-    // ── parse_sse ─────────────────────────────────────────────────────────────
+    // ── extract_openai_response_text ──────────────────────────────────────────
 
     #[test]
-    fn parse_sse_empty_string() {
-        let (inp, out, text) = parse_sse("");
+    fn extract_openai_response_text_normal() {
+        let v = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "Hello!"}}]
+        });
+        assert_eq!(extract_openai_response_text(&v), "Hello!");
+    }
+
+    #[test]
+    fn extract_openai_response_text_empty_choices() {
+        let v = serde_json::json!({"choices": []});
+        assert_eq!(extract_openai_response_text(&v), "");
+    }
+
+    // ── parse_anthropic_sse ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_anthropic_sse_empty_string() {
+        let (inp, out, text) = parse_anthropic_sse("");
         assert_eq!((inp, out, text.as_str()), (0, 0, ""));
     }
 
     #[test]
-    fn parse_sse_full_stream() {
+    fn parse_anthropic_sse_full_stream() {
         let raw = concat!(
             "event: message_start\n",
             "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":8}}}\n",
@@ -571,21 +699,21 @@ mod tests {
             "event: message_stop\n",
             "data: {\"type\":\"message_stop\"}\n",
         );
-        let (inp, out, text) = parse_sse(raw);
+        let (inp, out, text) = parse_anthropic_sse(raw);
         assert_eq!(inp, 8);
         assert_eq!(out, 2);
         assert_eq!(text, "Hello world");
     }
 
     #[test]
-    fn parse_sse_ignores_malformed_json_lines() {
+    fn parse_anthropic_sse_ignores_malformed_json_lines() {
         let raw = "data: not-json\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n";
-        let (inp, _, _) = parse_sse(raw);
+        let (inp, _, _) = parse_anthropic_sse(raw);
         assert_eq!(inp, 3);
     }
 
     #[test]
-    fn parse_sse_accumulates_multiple_text_deltas() {
+    fn parse_anthropic_sse_accumulates_multiple_text_deltas() {
         let deltas = (0..5)
             .map(|i| {
                 format!(
@@ -593,7 +721,45 @@ mod tests {
                 )
             })
             .collect::<String>();
-        let (_, _, text) = parse_sse(&deltas);
+        let (_, _, text) = parse_anthropic_sse(&deltas);
+        assert_eq!(text, "01234");
+    }
+
+    // ── parse_openai_sse ──────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_openai_sse_empty_string() {
+        let (pt, ct, text) = parse_openai_sse("");
+        assert_eq!((pt, ct, text.as_str()), (0, 0, ""));
+    }
+
+    #[test]
+    fn parse_openai_sse_full_stream_with_usage() {
+        let raw = concat!(
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n",
+            "\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n",
+            "\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" there\"},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n",
+            "\n",
+            "data: [DONE]\n",
+        );
+        let (pt, ct, text) = parse_openai_sse(raw);
+        assert_eq!(pt, 5);
+        assert_eq!(ct, 2);
+        assert_eq!(text, "Hi there");
+    }
+
+    #[test]
+    fn parse_openai_sse_accumulates_deltas() {
+        let deltas = (0..5)
+            .map(|i| {
+                format!(
+                    "data: {{\"id\":\"c\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{i}\"}}}}]}}\n"
+                )
+            })
+            .collect::<String>();
+        let (_, _, text) = parse_openai_sse(&deltas);
         assert_eq!(text, "01234");
     }
 }
@@ -611,8 +777,6 @@ mod integration {
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use axum::routing::post;
-    use axum::Router;
     use http_body_util::BodyExt;
     use tokio::sync::Mutex;
     use tower::ServiceExt;
@@ -622,23 +786,28 @@ mod integration {
     use crate::db::Database;
     use crate::loop_detector::LoopDetector;
     use crate::AppState;
-    use super::handle_messages;
+    use super::make_app;
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
-    fn make_state(upstream_url: String) -> Arc<AppState> {
+    fn make_state(anthropic_upstream_url: String) -> Arc<AppState> {
         Arc::new(AppState {
             db: Database::new(":memory:").unwrap(),
             loop_detector: Mutex::new(LoopDetector::new()),
             http_client: reqwest::Client::new(),
-            upstream_url,
+            anthropic_upstream: anthropic_upstream_url,
+            openai_upstream: "https://api.openai.com/v1/chat/completions".to_string(),
         })
     }
 
-    fn make_app(state: Arc<AppState>) -> Router {
-        Router::new()
-            .route("/v1/messages", post(handle_messages))
-            .with_state(state)
+    fn make_state_with_openai(anthropic_upstream_url: String, openai_upstream_url: String) -> Arc<AppState> {
+        Arc::new(AppState {
+            db: Database::new(":memory:").unwrap(),
+            loop_detector: Mutex::new(LoopDetector::new()),
+            http_client: reqwest::Client::new(),
+            anthropic_upstream: anthropic_upstream_url,
+            openai_upstream: openai_upstream_url,
+        })
     }
 
     async fn collect_body(body: Body) -> bytes::Bytes {
@@ -654,6 +823,17 @@ mod integration {
     const STREAM_REQ: &str = r#"{
         "model": "claude-test",
         "max_tokens": 10,
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}]
+    }"#;
+
+    const OAI_BUFFERED_REQ: &str = r#"{
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}]
+    }"#;
+
+    const OAI_STREAM_REQ: &str = r#"{
+        "model": "gpt-4o",
         "stream": true,
         "messages": [{"role": "user", "content": "hi"}]
     }"#;
@@ -845,7 +1025,231 @@ mod integration {
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
-    // ── live test (requires real API key) ─────────────────────────────────────
+    // ── OpenAI buffered path ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn openai_buffered_complete_response_returned_to_client() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(serde_json::json!({
+                        "id": "chatcmpl-1",
+                        "object": "chat.completion",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "Hello!"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let state = make_state_with_openai(
+            "https://api.anthropic.com/v1/messages".to_string(),
+            format!("{}/v1/chat/completions", server.uri()),
+        );
+        let resp = make_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(OAI_BUFFERED_REQ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = collect_body(resp.into_body()).await;
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(json["choices"][0]["message"]["content"], "Hello!");
+        assert_eq!(json["usage"]["prompt_tokens"], 5);
+        assert_eq!(json["usage"]["completion_tokens"], 3);
+
+        // DB row logged with correct token counts and extracted output text.
+        let rows = state.db.query_recent(1).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].prompt_tokens, 5);
+        assert_eq!(rows[0].output_tokens, 3);
+        assert_eq!(rows[0].output_text, "Hello!");
+    }
+
+    // ── OpenAI streaming path ─────────────────────────────────────────────────
+
+    const OAI_SSE_BODY: &str = concat!(
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n",
+        "\n",
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n",
+        "\n",
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" there\"},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n",
+        "\n",
+        "data: [DONE]\n",
+    );
+
+    #[tokio::test]
+    async fn openai_streaming_full_sse_stream_forwarded_to_client() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(OAI_SSE_BODY),
+            )
+            .mount(&server)
+            .await;
+
+        let state = make_state_with_openai(
+            "https://api.anthropic.com/v1/messages".to_string(),
+            format!("{}/v1/chat/completions", server.uri()),
+        );
+        let resp = make_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(OAI_STREAM_REQ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = collect_body(resp.into_body()).await;
+        let body_str = std::str::from_utf8(&bytes).unwrap();
+
+        // SSE chunks must reach the client.
+        assert!(body_str.contains("chatcmpl-1"), "missing id");
+        assert!(body_str.contains("\"Hi\""), "missing first text delta");
+        assert!(body_str.contains("\" there\""), "missing second text delta");
+        assert!(body_str.contains("[DONE]"), "missing done marker");
+
+        // The spawned logger needs a moment to write after the stream closes.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let rows = state.db.query_recent(1).unwrap();
+        assert_eq!(rows.len(), 1, "streaming call must be logged");
+        assert_eq!(rows[0].prompt_tokens, 5);
+        assert_eq!(rows[0].output_tokens, 2);
+        assert_eq!(rows[0].output_text, "Hi there", "output text must be reconstructed from deltas");
+    }
+
+    #[tokio::test]
+    async fn openai_buffered_upstream_error_forwarded() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(serde_json::json!({
+                        "error": {"type": "invalid_api_key", "message": "bad key"}
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let state = make_state_with_openai(
+            "https://api.anthropic.com/v1/messages".to_string(),
+            format!("{}/v1/chat/completions", server.uri()),
+        );
+        let resp = make_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(OAI_BUFFERED_REQ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── both providers from the same app instance ─────────────────────────────
+
+    #[tokio::test]
+    async fn both_providers_log_to_same_db() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(serde_json::json!({
+                        "id": "msg_01", "type": "message", "role": "assistant",
+                        "model": "claude-haiku-4-5", "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "anthropic reply"}],
+                        "usage": {"input_tokens": 5, "output_tokens": 3}
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(serde_json::json!({
+                        "id": "chatcmpl-1", "object": "chat.completion",
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": "openai reply"}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let state = make_state_with_openai(
+            format!("{}/v1/messages", server.uri()),
+            format!("{}/v1/chat/completions", server.uri()),
+        );
+        let app = make_app(state.clone());
+
+        // Fire Anthropic call.
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST").uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(BUFFERED_REQ)).unwrap(),
+            )
+            .await.unwrap();
+
+        // Fire OpenAI call.
+        app.oneshot(
+            Request::builder()
+                .method("POST").uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(OAI_BUFFERED_REQ)).unwrap(),
+        )
+        .await.unwrap();
+
+        let rows = state.db.query_recent(10).unwrap();
+        assert_eq!(rows.len(), 2, "both calls must be logged to the same DB");
+        // newest first — OpenAI was second
+        assert_eq!(rows[0].output_text, "openai reply");
+        assert_eq!(rows[0].prompt_tokens, 4);
+        assert_eq!(rows[0].output_tokens, 2);
+        assert_eq!(rows[1].output_text, "anthropic reply");
+        assert_eq!(rows[1].prompt_tokens, 5);
+        assert_eq!(rows[1].output_tokens, 3);
+    }
+
+    // ── live tests (require real API keys) ────────────────────────────────────
 
     #[tokio::test]
     #[ignore = "requires ANTHROPIC_API_KEY; run: cargo test live -- --ignored"]
@@ -913,6 +1317,77 @@ mod integration {
         assert_eq!(rows.len(), 1);
         assert!(rows[0].prompt_tokens > 0);
         assert!(rows[0].output_tokens > 0);
+        assert!(!rows[0].output_text.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires OPENAI_API_KEY with billing credits; run: cargo test live -- --ignored"]
+    async fn live_openai_buffered_round_trip() {
+        let key = std::env::var("OPENAI_API_KEY").expect("set OPENAI_API_KEY");
+
+        let state = make_state_with_openai(
+            "https://api.anthropic.com/v1/messages".to_string(),
+            "https://api.openai.com/v1/chat/completions".to_string(),
+        );
+        let resp = make_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {key}"))
+                    .body(Body::from(r#"{"model":"gpt-4o-mini","max_tokens":20,"messages":[{"role":"user","content":"Reply with: pong"}]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = collect_body(resp.into_body()).await;
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["object"], "chat.completion", "unexpected response: {json}");
+        let text = json["choices"][0]["message"]["content"].as_str().unwrap_or("");
+        assert!(!text.is_empty(), "response text is empty");
+
+        let rows = state.db.query_recent(1).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].prompt_tokens > 0);
+        assert!(rows[0].output_tokens > 0);
+        assert!(!rows[0].output_text.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires OPENAI_API_KEY with billing credits; run: cargo test live -- --ignored"]
+    async fn live_openai_streaming_round_trip() {
+        let key = std::env::var("OPENAI_API_KEY").expect("set OPENAI_API_KEY");
+
+        let state = make_state_with_openai(
+            "https://api.anthropic.com/v1/messages".to_string(),
+            "https://api.openai.com/v1/chat/completions".to_string(),
+        );
+        let resp = make_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {key}"))
+                    .body(Body::from(r#"{"model":"gpt-4o-mini","max_tokens":20,"stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"Reply with: pong"}]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = collect_body(resp.into_body()).await;
+        let body_str = std::str::from_utf8(&bytes).unwrap();
+        assert!(body_str.contains("chat.completion.chunk"), "missing SSE chunks");
+        assert!(body_str.contains("[DONE]"), "stream not terminated");
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let rows = state.db.query_recent(1).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].prompt_tokens > 0, "prompt_tokens not logged (need stream_options.include_usage)");
         assert!(!rows[0].output_text.is_empty());
     }
 }

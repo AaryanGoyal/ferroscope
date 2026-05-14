@@ -6,7 +6,6 @@ mod tui;
 
 use std::sync::Arc;
 
-use axum::{Router, routing::post};
 use clap::{Parser, Subcommand};
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
@@ -18,7 +17,8 @@ pub struct AppState {
     pub db: Database,
     pub loop_detector: Mutex<LoopDetector>,
     pub http_client: reqwest::Client,
-    pub upstream_url: String,
+    pub anthropic_upstream: String,
+    pub openai_upstream: String,
 }
 
 #[derive(Parser)]
@@ -36,9 +36,13 @@ struct Cli {
     #[arg(long, global = true)]
     tui: bool,
 
-    /// Override the upstream LLM API URL.
+    /// Override the upstream Anthropic API URL.
     #[arg(long, default_value = "https://api.anthropic.com/v1/messages", global = true)]
-    upstream: String,
+    anthropic_upstream: String,
+
+    /// Override the upstream OpenAI API URL.
+    #[arg(long, default_value = "https://api.openai.com/v1/chat/completions", global = true)]
+    openai_upstream: String,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -63,15 +67,15 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Commands::Run(args)) => {
-            run_subcommand(&cli.db, &cli.upstream, cli.tui, args).await
+            run_subcommand(&cli.db, &cli.anthropic_upstream, &cli.openai_upstream, cli.tui, args).await
         }
         None => {
-            serve(&cli.addr, &cli.db, &cli.upstream, cli.tui).await
+            serve(&cli.addr, &cli.db, &cli.anthropic_upstream, &cli.openai_upstream, cli.tui).await
         }
     }
 }
 
-async fn serve(addr: &str, db_path: &str, upstream: &str, with_tui: bool) -> anyhow::Result<()> {
+async fn serve(addr: &str, db_path: &str, anthropic_upstream: &str, openai_upstream: &str, with_tui: bool) -> anyhow::Result<()> {
     if with_tui {
         let log_file = std::fs::File::create("ferroscope.log")?;
         tracing_subscriber::fmt()
@@ -103,20 +107,19 @@ async fn serve(addr: &str, db_path: &str, upstream: &str, with_tui: bool) -> any
         });
     }
 
-    start_server(addr, db, upstream).await
+    start_server(addr, db, anthropic_upstream, openai_upstream).await
 }
 
-async fn start_server(addr: &str, db: Database, upstream: &str) -> anyhow::Result<()> {
+async fn start_server(addr: &str, db: Database, anthropic_upstream: &str, openai_upstream: &str) -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         db,
         loop_detector: Mutex::new(LoopDetector::new()),
         http_client: reqwest::Client::new(),
-        upstream_url: upstream.to_string(),
+        anthropic_upstream: anthropic_upstream.to_string(),
+        openai_upstream: openai_upstream.to_string(),
     });
 
-    let app = Router::new()
-        .route("/v1/messages", post(proxy::handle_messages))
-        .with_state(state);
+    let app = proxy::make_app(state);
 
     tracing::info!("ferroscope listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
@@ -136,7 +139,8 @@ async fn start_server(addr: &str, db: Database, upstream: &str) -> anyhow::Resul
 
 async fn run_subcommand(
     db_path: &str,
-    upstream: &str,
+    anthropic_upstream: &str,
+    openai_upstream: &str,
     with_tui: bool,
     args: RunArgs,
 ) -> anyhow::Result<()> {
@@ -156,7 +160,7 @@ async fn run_subcommand(
     // Bind port 0 → OS assigns a free port; keep listener alive to hold the port.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
-    let proxy_url = format!("http://127.0.0.1:{port}/v1/messages");
+    let base_url = format!("http://127.0.0.1:{port}");
 
     tracing::info!("ferroscope proxy on :{port}");
 
@@ -177,11 +181,10 @@ async fn run_subcommand(
         db: db.clone(),
         loop_detector: Mutex::new(LoopDetector::new()),
         http_client: reqwest::Client::new(),
-        upstream_url: upstream.to_string(),
+        anthropic_upstream: anthropic_upstream.to_string(),
+        openai_upstream: openai_upstream.to_string(),
     });
-    let app = Router::new()
-        .route("/v1/messages", post(proxy::handle_messages))
-        .with_state(state);
+    let app = proxy::make_app(state);
 
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
@@ -193,8 +196,8 @@ async fn run_subcommand(
     let (program, child_args) = args.cmd.split_first().unwrap();
     let status = tokio::process::Command::new(program)
         .args(child_args)
-        .env("ANTHROPIC_BASE_URL", &proxy_url)
-        .env("OPENAI_BASE_URL", &proxy_url)
+        .env("ANTHROPIC_BASE_URL", &base_url)
+        .env("OPENAI_BASE_URL", &base_url)
         .status()
         .await?;
 
