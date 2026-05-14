@@ -54,7 +54,7 @@ impl LoopDetector {
 }
 
 /// Returns a value in [0.0, 1.0]: 1.0 = identical, 0.0 = nothing in common.
-fn normalized_levenshtein(a: &str, b: &str) -> f64 {
+pub(crate) fn normalized_levenshtein(a: &str, b: &str) -> f64 {
     if a.is_empty() && b.is_empty() {
         return 1.0;
     }

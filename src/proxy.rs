@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::db::CallRecord;
-use crate::AppState;
+use crate::{classifiers, AppState};
 
 // Hop-by-hop headers stripped from the client → upstream direction.
 const STRIP_REQUEST_HEADERS: &[&str] =
@@ -152,6 +152,7 @@ async fn stream_response(
             loop_detected,
             input_text,
             output_text,
+            classifier: None,
         };
         tracing::info!(
             model = record.model,
@@ -161,8 +162,9 @@ async fn stream_response(
             cost_usd = record.cost_usd,
             "call logged (stream)"
         );
-        if let Err(e) = db.insert_call(&record) {
-            tracing::error!("db insert: {e}");
+        match db.insert_call(&record) {
+            Ok(_) => run_classifiers(&db),
+            Err(e) => tracing::error!("db insert: {e}"),
         }
     });
 
@@ -204,6 +206,7 @@ async fn buffered_response(
         loop_detected,
         input_text,
         output_text,
+        classifier: None,
     };
     tracing::info!(
         model = record.model,
@@ -213,8 +216,9 @@ async fn buffered_response(
         cost_usd = record.cost_usd,
         "call logged"
     );
-    if let Err(e) = state.db.insert_call(&record) {
-        tracing::error!("db insert: {e}");
+    match state.db.insert_call(&record) {
+        Ok(_) => run_classifiers(&state.db),
+        Err(e) => tracing::error!("db insert: {e}"),
     }
 
     build_response(status, resp_headers, Body::from(bytes))
@@ -352,6 +356,25 @@ fn model_pricing(model: &str) -> (f64, f64) {
 fn compute_cost(model: &str, input_tokens: i64, output_tokens: i64) -> f64 {
     let (ir, or_) = model_pricing(model);
     (input_tokens as f64 * ir + output_tokens as f64 * or_) / 1_000_000.0
+}
+
+fn run_classifiers(db: &crate::db::Database) {
+    match classifiers::run_all(db) {
+        Ok(result) => {
+            for d in &result.detections {
+                tracing::warn!(classifier = %d.classifier, detail = %d.detail, "classifier fired");
+                if let Err(e) = db.insert_detection(d) {
+                    tracing::error!("detection insert: {e}");
+                }
+            }
+            for (id, name) in &result.call_tags {
+                if let Err(e) = db.update_call_classifier(*id, name) {
+                    tracing::error!("call classifier update: {e}");
+                }
+            }
+        }
+        Err(e) => tracing::error!("classifiers error: {e}"),
+    }
 }
 
 #[cfg(test)]
