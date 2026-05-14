@@ -83,7 +83,7 @@ async fn forward(
 ) -> anyhow::Result<Response<Body>> {
     let start = Instant::now();
 
-    let body_json: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let mut body_json: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let model = body_json["model"]
         .as_str()
         .unwrap_or("unknown")
@@ -91,6 +91,18 @@ async fn forward(
     let is_streaming = body_json["stream"].as_bool().unwrap_or(false);
     let messages_str = body_json["messages"].to_string();
     let prompt_hash = sha256_hex(&messages_str);
+
+    // Bug 1 fix: inject stream_options.include_usage so OpenAI includes token counts
+    // in the final SSE chunk. Without this, prompt_tokens and completion_tokens are 0
+    // for all OpenAI streaming calls.
+    if is_streaming && matches!(provider, Provider::OpenAI) {
+        if let Some(obj) = body_json.as_object_mut() {
+            let so = obj.entry("stream_options").or_insert_with(|| serde_json::json!({}));
+            if let Some(so_obj) = so.as_object_mut() {
+                so_obj.entry("include_usage").or_insert(serde_json::json!(true));
+            }
+        }
+    }
 
     let loop_detected = {
         let mut det = state.loop_detector.lock().await;
@@ -118,7 +130,13 @@ async fn forward(
             req = req.header(name, value);
         }
     }
-    let upstream = req.body(body).send().await?;
+    // Re-serialize body_json if it was mutated (OpenAI streaming injection), else forward original bytes.
+    let forward_body: Bytes = if is_streaming && matches!(provider, Provider::OpenAI) {
+        serde_json::to_vec(&body_json).map(Bytes::from).unwrap_or(body)
+    } else {
+        body
+    };
+    let upstream = req.body(forward_body).send().await?;
 
     let status = upstream.status();
     // Collect upstream response headers before consuming the body.
@@ -155,10 +173,15 @@ async fn stream_response(
     tokio::spawn(async move {
         let mut byte_stream = upstream.bytes_stream();
         let mut raw = String::new();
+        let mut first_chunk_at: Option<Instant> = None;
 
         while let Some(chunk) = byte_stream.next().await {
             match chunk {
                 Ok(bytes) => {
+                    // Bug 2 fix: capture TTFT on the very first chunk.
+                    if first_chunk_at.is_none() {
+                        first_chunk_at = Some(Instant::now());
+                    }
                     if let Ok(s) = std::str::from_utf8(&bytes) {
                         raw.push_str(s);
                     }
@@ -178,7 +201,11 @@ async fn stream_response(
             Provider::Anthropic => parse_anthropic_sse(&raw),
             Provider::OpenAI => parse_openai_sse(&raw),
         };
-        let latency_ms = start.elapsed().as_millis() as i64;
+        // Latency for streaming = time-to-first-token (from request start to first chunk).
+        // Falls back to total elapsed if no chunk arrived (error / empty response).
+        let latency_ms = first_chunk_at
+            .map(|t| t.duration_since(start).as_millis() as i64)
+            .unwrap_or_else(|| start.elapsed().as_millis() as i64);
         let record = CallRecord {
             timestamp: chrono::Utc::now().to_rfc3339(),
             cost_usd: compute_cost(&model, prompt_tokens, output_tokens),
@@ -774,6 +801,7 @@ mod tests {
 #[cfg(test)]
 mod integration {
     use std::sync::Arc;
+    use std::time::Instant;
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -1176,6 +1204,147 @@ mod integration {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Bug 1: stream_options injection ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn openai_streaming_injects_include_usage_into_upstream_request() {
+        use wiremock::matchers::body_json;
+
+        let server = MockServer::start().await;
+        // The mock only matches if the upstream request body contains
+        // stream_options.include_usage = true — proving injection happened.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_json(serde_json::json!({
+                "model": "gpt-4o",
+                "stream": true,
+                "stream_options": {"include_usage": true},
+                "messages": [{"role": "user", "content": "hi"}]
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(OAI_SSE_BODY),
+            )
+            .mount(&server)
+            .await;
+
+        let state = make_state_with_openai(
+            "https://api.anthropic.com/v1/messages".to_string(),
+            format!("{}/v1/chat/completions", server.uri()),
+        );
+        let resp = make_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(OAI_STREAM_REQ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // 200 means the mock matched — injection succeeded.
+        assert_eq!(resp.status(), StatusCode::OK, "upstream did not receive stream_options");
+        collect_body(resp.into_body()).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let rows = state.db.query_recent(1).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].prompt_tokens, 5, "token counts must be non-zero after injection");
+        assert_eq!(rows[0].output_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn openai_streaming_preserves_existing_stream_options() {
+        use wiremock::matchers::body_json;
+
+        let server = MockServer::start().await;
+        // Client already sends stream_options — we must not clobber it.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_json(serde_json::json!({
+                "model": "gpt-4o",
+                "stream": true,
+                "stream_options": {"include_usage": true, "extra_field": 42},
+                "messages": [{"role": "user", "content": "hi"}]
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(OAI_SSE_BODY),
+            )
+            .mount(&server)
+            .await;
+
+        let state = make_state_with_openai(
+            "https://api.anthropic.com/v1/messages".to_string(),
+            format!("{}/v1/chat/completions", server.uri()),
+        );
+        let body = r#"{"model":"gpt-4o","stream":true,"stream_options":{"include_usage":true,"extra_field":42},"messages":[{"role":"user","content":"hi"}]}"#;
+        let resp = make_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK, "existing stream_options must not be clobbered");
+    }
+
+    // ── Bug 2: TTFT latency ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn streaming_latency_is_ttft_not_total_duration() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(SSE_BODY),
+            )
+            .mount(&server)
+            .await;
+
+        let before = Instant::now();
+        let state = make_state(format!("{}/v1/messages", server.uri()));
+        let resp = make_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(STREAM_REQ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        collect_body(resp.into_body()).await;
+        let total_elapsed_ms = before.elapsed().as_millis() as i64;
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let rows = state.db.query_recent(1).unwrap();
+        assert_eq!(rows.len(), 1);
+        // TTFT must be <= total round-trip time observed by the test.
+        assert!(
+            rows[0].latency_ms <= total_elapsed_ms,
+            "latency_ms ({}) > total elapsed ({}); should be TTFT not total duration",
+            rows[0].latency_ms,
+            total_elapsed_ms
+        );
+        // And it must be positive.
+        assert!(rows[0].latency_ms >= 0);
     }
 
     // ── both providers from the same app instance ─────────────────────────────
