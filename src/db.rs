@@ -138,6 +138,29 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// Returns the ID of an existing detection for the same classifier whose run starts
+    /// at `first_call_id`. Used to replace growing detections (retry_storm, ping_pong)
+    /// in-place rather than accumulating duplicate rows.
+    pub fn detection_with_first_call(&self, classifier: &str, first_call_id: &str) -> anyhow::Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT id FROM detections WHERE classifier = ?1 AND (call_ids = ?2 OR call_ids LIKE ?3) LIMIT 1",
+            params![classifier, first_call_id, format!("{first_call_id},%")],
+            |r| r.get::<_, i64>(0),
+        );
+        match result {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn delete_detection(&self, id: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM detections WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     pub fn update_call_classifier(&self, id: i64, classifier: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -442,5 +465,73 @@ mod tests {
         db.update_call_classifier(id, "cost_inflation").unwrap();
         let rows = db.query_recent(1).unwrap();
         assert_eq!(rows[0].classifier.as_deref(), Some("cost_inflation"));
+    }
+
+    // ── detection_with_first_call / delete_detection ──────────────────────────
+
+    #[test]
+    fn detection_with_first_call_finds_exact_match() {
+        let db = mem_db();
+        let d = Detection {
+            timestamp: "2026-05-14T00:00:00Z".to_string(),
+            classifier: "retry_storm".to_string(),
+            call_ids: "1,2,3".to_string(),
+            detail: "test".to_string(),
+            suggested_fix: "fix".to_string(),
+            cost_usd: 0.0,
+        };
+        let inserted_id = db.insert_detection(&d).unwrap();
+        let found = db.detection_with_first_call("retry_storm", "1").unwrap();
+        assert_eq!(found, Some(inserted_id));
+    }
+
+    #[test]
+    fn detection_with_first_call_no_match_on_wrong_classifier() {
+        let db = mem_db();
+        let d = Detection {
+            timestamp: "2026-05-14T00:00:00Z".to_string(),
+            classifier: "retry_storm".to_string(),
+            call_ids: "1,2,3".to_string(),
+            detail: "test".to_string(),
+            suggested_fix: "fix".to_string(),
+            cost_usd: 0.0,
+        };
+        db.insert_detection(&d).unwrap();
+        let found = db.detection_with_first_call("ping_pong", "1").unwrap();
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn detection_with_first_call_no_match_on_wrong_first_id() {
+        let db = mem_db();
+        let d = Detection {
+            timestamp: "2026-05-14T00:00:00Z".to_string(),
+            classifier: "retry_storm".to_string(),
+            call_ids: "1,2,3".to_string(),
+            detail: "test".to_string(),
+            suggested_fix: "fix".to_string(),
+            cost_usd: 0.0,
+        };
+        db.insert_detection(&d).unwrap();
+        // "11" must not match call_ids starting with "1,"
+        let found = db.detection_with_first_call("retry_storm", "11").unwrap();
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn delete_detection_removes_row() {
+        let db = mem_db();
+        let d = Detection {
+            timestamp: "2026-05-14T00:00:00Z".to_string(),
+            classifier: "ping_pong".to_string(),
+            call_ids: "5,6,7".to_string(),
+            detail: "test".to_string(),
+            suggested_fix: "fix".to_string(),
+            cost_usd: 0.0,
+        };
+        let id = db.insert_detection(&d).unwrap();
+        assert_eq!(db.query_recent_detections(10).unwrap().len(), 1);
+        db.delete_detection(id).unwrap();
+        assert_eq!(db.query_recent_detections(10).unwrap().len(), 0);
     }
 }

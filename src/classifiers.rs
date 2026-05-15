@@ -70,9 +70,11 @@ fn model_tier(model: &str) -> u8 {
 }
 
 /// Similar prompt sent consecutively with the model tier escalating.
-pub fn check_cost_inflation(calls: &[CallRow]) -> Option<Detection> {
+/// Returns one Detection per escalating consecutive pair found in the window.
+pub fn check_cost_inflation(calls: &[CallRow]) -> Vec<Detection> {
+    let mut detections = Vec::new();
     if calls.len() < 2 {
-        return None;
+        return detections;
     }
     for i in 0..calls.len() - 1 {
         let a = &calls[i];
@@ -85,7 +87,7 @@ pub fn check_cost_inflation(calls: &[CallRow]) -> Option<Detection> {
         let fp_a: String = a.input_text.chars().take(FINGERPRINT).collect();
         let fp_b: String = b.input_text.chars().take(FINGERPRINT).collect();
         if normalized_levenshtein(&fp_a, &fp_b) >= SIM_THRESHOLD {
-            return Some(Detection {
+            detections.push(Detection {
                 timestamp: Utc::now().to_rfc3339(),
                 classifier: "cost_inflation".to_string(),
                 call_ids: format!("{},{}", a.id, b.id),
@@ -100,7 +102,7 @@ pub fn check_cost_inflation(calls: &[CallRow]) -> Option<Detection> {
             });
         }
     }
-    None
+    detections
 }
 
 // ── self_correction ───────────────────────────────────────────────────────────
@@ -235,9 +237,7 @@ pub fn run_all(db: &crate::db::Database) -> anyhow::Result<ClassifierResult> {
     if let Some(d) = check_retry_storm(&calls) {
         detections.push(d);
     }
-    if let Some(d) = check_cost_inflation(&calls) {
-        detections.push(d);
-    }
+    detections.extend(check_cost_inflation(&calls));
     if let Some(d) = check_self_correction(&calls) {
         detections.push(d);
     }
@@ -327,10 +327,11 @@ mod tests {
             make_call(1, "claude-haiku-4-5", similar_prompt(), "ok", 0.001),
             make_call(2, "claude-sonnet-4-6", similar_prompt(), "ok", 0.01),
         ];
-        let d = check_cost_inflation(&calls).expect("should detect cost inflation");
-        assert_eq!(d.classifier, "cost_inflation");
-        assert!(d.detail.contains("tier 1"));
-        assert!(d.detail.contains("tier 2"));
+        let ds = check_cost_inflation(&calls);
+        assert_eq!(ds.len(), 1, "should detect one escalation");
+        assert_eq!(ds[0].classifier, "cost_inflation");
+        assert!(ds[0].detail.contains("tier 1"));
+        assert!(ds[0].detail.contains("tier 2"));
     }
 
     #[test]
@@ -339,8 +340,22 @@ mod tests {
             make_call(1, "claude-sonnet-4-6", similar_prompt(), "ok", 0.01),
             make_call(2, "claude-opus-4-7", similar_prompt(), "ok", 0.1),
         ];
-        let d = check_cost_inflation(&calls).unwrap();
-        assert_eq!(d.classifier, "cost_inflation");
+        let ds = check_cost_inflation(&calls);
+        assert_eq!(ds.len(), 1);
+        assert_eq!(ds[0].classifier, "cost_inflation");
+    }
+
+    #[test]
+    fn cost_inflation_detects_full_haiku_sonnet_opus_chain() {
+        let calls = vec![
+            make_call(1, "claude-haiku-4-5",  similar_prompt(), "ok", 0.001),
+            make_call(2, "claude-sonnet-4-6", similar_prompt(), "ok", 0.01),
+            make_call(3, "claude-opus-4-7",   similar_prompt(), "ok", 0.1),
+        ];
+        let ds = check_cost_inflation(&calls);
+        assert_eq!(ds.len(), 2, "should detect haiku→sonnet and sonnet→opus as separate escalations");
+        assert!(ds[0].call_ids.contains("1") && ds[0].call_ids.contains("2"));
+        assert!(ds[1].call_ids.contains("2") && ds[1].call_ids.contains("3"));
     }
 
     #[test]
@@ -349,7 +364,7 @@ mod tests {
             make_call(1, "claude-haiku-4-5", similar_prompt(), "ok", 0.001),
             make_call(2, "claude-haiku-4-5", similar_prompt(), "ok", 0.001),
         ];
-        assert!(check_cost_inflation(&calls).is_none());
+        assert!(check_cost_inflation(&calls).is_empty());
     }
 
     #[test]
@@ -358,7 +373,7 @@ mod tests {
             make_call(1, "claude-haiku-4-5", "completely different question about cats", "ok", 0.001),
             make_call(2, "claude-sonnet-4-6", similar_prompt(), "ok", 0.01),
         ];
-        assert!(check_cost_inflation(&calls).is_none());
+        assert!(check_cost_inflation(&calls).is_empty());
     }
 
     #[test]
@@ -367,7 +382,7 @@ mod tests {
             make_call(1, "claude-opus-4-7", similar_prompt(), "ok", 0.1),
             make_call(2, "claude-haiku-4-5", similar_prompt(), "ok", 0.001),
         ];
-        assert!(check_cost_inflation(&calls).is_none());
+        assert!(check_cost_inflation(&calls).is_empty());
     }
 
     // ── self_correction ───────────────────────────────────────────────────────

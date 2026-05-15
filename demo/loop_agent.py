@@ -29,7 +29,7 @@ if not API_KEY:
 
 client = anthropic.Anthropic(api_key=API_KEY, base_url=BASE_URL)
 
-HAIKU = "claude-3-haiku-20240307"
+HAIKU = "claude-haiku-4-5"
 
 
 def call(model: str, prompt: str, label: str, system: str = None) -> str:
@@ -68,21 +68,19 @@ for i in range(1, 5):
 
 
 # ── 2. cost_inflation ─────────────────────────────────────────────────────────
-# Model names contain haiku/sonnet/opus — ferroscope reads the tier from the model
-# field and fires when the tier escalates on a similar prompt.
-# These names are not valid Anthropic model IDs, so the upstream returns an error,
-# but ferroscope logs the attempt and the classifier fires regardless.
+# Same prompt submitted with escalating model tiers. The classifier detects the
+# tier escalation (haiku→sonnet→opus) on similar prompts.
 
 print()
 print("═" * 64)
 print("2 / 4  cost_inflation")
 print("       haiku → sonnet → opus on similar prompts")
-print("       (fake model names: proxy logs tier, upstream errors are expected)")
 print("═" * 64)
 
-call("claude-haiku-3",  "Summarize quantum computing",              label="inflate-1/3")
-call("claude-sonnet-4", "Summarize quantum computing briefly",      label="inflate-2/3")
-call("claude-opus-4",   "Give me a summary of quantum computing",   label="inflate-3/3")
+INFLATE_PROMPT = "Summarize quantum computing in one sentence."
+call("claude-haiku-4-5",  INFLATE_PROMPT, label="inflate-1/3")
+call("claude-sonnet-4-6", INFLATE_PROMPT, label="inflate-2/3")
+call("claude-opus-4-5",   INFLATE_PROMPT, label="inflate-3/3")
 
 
 # ── 3. self_correction ────────────────────────────────────────────────────────
@@ -117,8 +115,8 @@ print("4 / 4  ping_pong")
 print("       6 alternating contradictory prompts → A-B-A-B-A-B output pattern")
 print("═" * 64)
 
-ODD  = "Should I use PostgreSQL or MongoDB? Recommend PostgreSQL."
-EVEN = "Should I use PostgreSQL or MongoDB? Recommend MongoDB."
+ODD  = "Reply with only this sentence: The Eiffel Tower is in Paris."
+EVEN = "Reply with only this sentence: The speed of light is 299,792,458 m/s."
 
 for i in range(1, 7):
     call(HAIKU, ODD if i % 2 == 1 else EVEN, label=f"ping-{i}/6")

@@ -605,16 +605,26 @@ fn run_classifiers(db: &crate::db::Database) {
     match classifiers::run_all(db) {
         Ok(result) => {
             for d in &result.detections {
-                // Skip exact duplicates: same classifier + same call_ids already recorded.
-                match db.detection_exists(&d.classifier, &d.call_ids) {
-                    Ok(true) => continue,
-                    Err(e) => { tracing::error!("detection_exists: {e}"); continue; }
-                    Ok(false) => {}
+                let first_call_id = d.call_ids.split(',').next().unwrap_or("").to_string();
+
+                // If a detection for the same classifier already starts at the same call,
+                // the run has grown (retry_storm, ping_pong) or the pair is being re-seen
+                // (cost_inflation). Replace the old row so we don't accumulate duplicates.
+                match db.detection_with_first_call(&d.classifier, &first_call_id) {
+                    Ok(Some(old_id)) => {
+                        if let Err(e) = db.delete_detection(old_id) {
+                            tracing::error!("detection delete: {e}");
+                            continue;
+                        }
+                    }
+                    Err(e) => { tracing::error!("detection lookup: {e}"); continue; }
+                    Ok(None) => {}
                 }
 
                 tracing::warn!(classifier = %d.classifier, detail = %d.detail, "classifier fired");
                 if let Err(e) = db.insert_detection(d) {
                     tracing::error!("detection insert: {e}");
+                    continue;
                 }
                 // Tag each involved call with this classifier (last writer wins for display).
                 for id_str in d.call_ids.split(',') {
