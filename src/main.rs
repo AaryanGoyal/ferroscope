@@ -148,14 +148,26 @@ async fn run_subcommand(
         anyhow::bail!("Usage: ferroscope run [--tui] [--] <command> [args...]");
     }
 
-    // Init logging to stderr so it doesn't pollute child stdout.
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive("ferroscope=info".parse()?),
-        )
-        .init();
+    // When the TUI owns the terminal, logs and child output must go to files —
+    // writing to stderr/stdout corrupts the alternate screen.
+    if with_tui {
+        let log_file = std::fs::File::create("ferroscope.log")?;
+        tracing_subscriber::fmt()
+            .with_writer(log_file)
+            .with_env_filter(
+                EnvFilter::from_default_env()
+                    .add_directive("ferroscope=info".parse()?),
+            )
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(
+                EnvFilter::from_default_env()
+                    .add_directive("ferroscope=info".parse()?),
+            )
+            .init();
+    }
 
     // Bind port 0 → OS assigns a free port; keep listener alive to hold the port.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -173,6 +185,9 @@ async fn run_subcommand(
             if let Err(e) = tui::run(tui_db) {
                 eprintln!("TUI error: {e}");
             }
+            // Exit the whole process when the user quits the TUI so the
+            // child process is not left orphaned.
+            std::process::exit(0);
         });
     }
 
@@ -193,13 +208,28 @@ async fn run_subcommand(
     });
 
     // Launch child process with env vars injected.
+    // When the TUI is active it owns the terminal, so redirect child
+    // stdout/stderr to agent.log to avoid corrupting the display.
     let (program, child_args) = args.cmd.split_first().unwrap();
-    let status = tokio::process::Command::new(program)
-        .args(child_args)
-        .env("ANTHROPIC_BASE_URL", &base_url)
-        .env("OPENAI_BASE_URL", &base_url)
-        .status()
-        .await?;
+    let status = if with_tui {
+        let agent_log = std::fs::File::create("agent.log")?;
+        let agent_log2 = agent_log.try_clone()?;
+        tokio::process::Command::new(program)
+            .args(child_args)
+            .env("ANTHROPIC_BASE_URL", &base_url)
+            .env("OPENAI_BASE_URL", &base_url)
+            .stdout(agent_log)
+            .stderr(agent_log2)
+            .status()
+            .await?
+    } else {
+        tokio::process::Command::new(program)
+            .args(child_args)
+            .env("ANTHROPIC_BASE_URL", &base_url)
+            .env("OPENAI_BASE_URL", &base_url)
+            .status()
+            .await?
+    };
 
     print_summary(&db, &session_start)?;
 
