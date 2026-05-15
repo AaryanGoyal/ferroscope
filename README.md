@@ -2,6 +2,8 @@
 
 An HTTP proxy that intercepts LLM API calls and runs loop-pattern classifiers across the call history.
 
+https://github.com/user-attachments/assets/69412831-dc01-4d55-b198-e6e8386241ad
+
 ---
 
 ## Why
